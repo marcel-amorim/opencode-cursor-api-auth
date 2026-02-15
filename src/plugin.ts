@@ -118,6 +118,55 @@ function extractPromptFromChatCompletions(body: any): {
   return { prompt: lines.join("\n\n"), model, stream, tools };
 }
 
+
+export type CursorStreamEvent =
+  | { type: "thinking"; text: string }
+  | { type: "content"; text: string }
+  | { type: "result"; text: string };
+
+export function parseCursorStreamLine(line: string): CursorStreamEvent | null {
+  if (!line || typeof line !== "string") return null;
+
+  try {
+    const data = JSON.parse(line);
+
+    // 1. Thinking delta
+    if (data.type === "thinking") {
+      if (data.subtype === "delta" && typeof data.text === "string") {
+        return { type: "thinking", text: data.text };
+      }
+      return null;
+    }
+
+    // 2. Assistant message
+    if (data.type === "assistant") {
+      if (
+        data.message?.role === "assistant" &&
+        Array.isArray(data.message.content) &&
+        data.message.content.length > 0
+      ) {
+        const firstPart = data.message.content[0];
+        if (firstPart.type === "text" && typeof firstPart.text === "string") {
+          return { type: "content", text: firstPart.text };
+        }
+      }
+      return null;
+    }
+
+    // 3. Result
+    if (data.type === "result") {
+      if (typeof data.result === "string") {
+        return { type: "result", text: data.result };
+      }
+      return null;
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function parseToolCallPlan(output: string): ToolCallPlan | null {
   const start = output.indexOf("{");
   const end = output.lastIndexOf("}");
@@ -204,7 +253,7 @@ function getGlobalKey(): string {
   return "__opencode_cursor_proxy_server__";
 }
 
-async function ensureCursorProxyServer(workspaceDirectory: string): Promise<string> {
+export async function ensureCursorProxyServer(workspaceDirectory: string): Promise<string> {
   const key = getGlobalKey();
   const g = globalThis as any;
 
@@ -251,7 +300,8 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
         "cursor-agent",
         "--print",
         "--output-format",
-        "text",
+        stream ? "stream-json" : "text",
+        ...(stream ? ["--stream-partial-output", "--trust"] : []),
         "--workspace",
         workspaceDirectory,
         "--model",
@@ -356,17 +406,71 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
               heartbeat();
               const interval = setInterval(heartbeat, 1000);
 
-              const [stdoutText, stderrText] = await Promise.all([
-                new Response(child.stdout).text(),
-                new Response(child.stderr).text(),
-              ]).finally(() => {
+              const decoder = new TextDecoder();
+              const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();
+              let fullOutput = "";
+              let accumulatedAssistant = "";
+              let buffer = "";
+
+              try {
+                while (true) {
+                  const { value, done } = await reader.read();
+                  if (done) break;
+
+                  const chunk = decoder.decode(value, { stream: true });
+                  buffer += chunk;
+
+                  const lines = buffer.split("\n");
+                  buffer = lines.pop() || "";
+
+                  for (const line of lines) {
+                    if (!line.trim()) continue;
+                    const event = parseCursorStreamLine(line);
+
+                    if (!event) continue;
+
+                    if (event.type === "thinking") {
+                      const chunk = createChatCompletionChunk(id, created, selectedModel, event.text, false);
+                      controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                    } else if (event.type === "content") {
+                      accumulatedAssistant += event.text;
+                      const chunk = createChatCompletionChunk(id, created, selectedModel, event.text, false);
+                      controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                    } else if (event.type === "result") {
+                      // Result typically contains the full text.
+                      // If we haven't streamed anything (e.g. no assistant events), we could stream this.
+                      // But to be safe and avoid duplication, we just use it for fullOutput.
+                      fullOutput = event.text;
+                    }
+                  }
+                }
+
+                // Process remaining buffer
+                if (buffer.trim()) {
+                  const event = parseCursorStreamLine(buffer);
+                  if (event) {
+                     if (event.type === "thinking") {
+                        const chunk = createChatCompletionChunk(id, created, selectedModel, event.text, false);
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                      } else if (event.type === "content") {
+                        accumulatedAssistant += event.text;
+                        const chunk = createChatCompletionChunk(id, created, selectedModel, event.text, false);
+                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                      } else if (event.type === "result") {
+                        fullOutput = event.text;
+                      }
+                  }
+                }
+              } finally {
                 clearInterval(interval);
-              });
+              }
 
-              const stdout = (stdoutText || "").trim();
-              const stderr = (stderrText || "").trim();
+              // Fallback if no result event was seen, use accumulated assistant text
+              if (!fullOutput && accumulatedAssistant) {
+                fullOutput = accumulatedAssistant;
+              }
 
-              const plan = parseToolCallPlan(stdout);
+              const plan = parseToolCallPlan(fullOutput);
               if (plan?.action === "tool_call") {
                 const toolCalls = plan.tool_calls.map((tc, i) => ({
                   index: i,
@@ -400,18 +504,23 @@ async function ensureCursorProxyServer(workspaceDirectory: string): Promise<stri
                 return;
               }
 
-              const content = plan?.action === "final" ? plan.content : stdout;
-              if (child.exitCode !== 0 && !plan) {
-                // Don't fail hard if stdout is usable; emit it as final content.
-                const msg = stdout || stderr;
-                const finalChunk = createChatCompletionChunk(id, created, selectedModel, msg, true);
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
-                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                return;
+              const content = plan?.action === "final" ? plan.content : "";
+              
+              // If we already streamed the content via assistant events, we don't need to send it again.
+              // But we do need to send a final stop chunk.
+              // However, if the parsed content is DIFFERENT from what we accumulated (e.g. result event had more),
+              // we might need to send the diff?
+              // Current safe approach: if we streamed 'accumulatedAssistant', and 'content' is roughly same, done.
+              // If 'content' is present but 'accumulatedAssistant' is empty, send content.
+
+              if (!accumulatedAssistant && content) {
+                 const finalChunk = createChatCompletionChunk(id, created, selectedModel, content, true);
+                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
+              } else {
+                 const doneChunk = createChatCompletionChunk(id, created, selectedModel, "", true);
+                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(doneChunk)}\n\n`));
               }
 
-              const finalChunk = createChatCompletionChunk(id, created, selectedModel, content, true);
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
               controller.enqueue(encoder.encode("data: [DONE]\n\n"));
               return;
             }
