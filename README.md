@@ -1,21 +1,21 @@
 # opencode-cursor-api-auth
 
-Use Cursor Cloud Agents API inside OpenCode.
+Use local `cursor-agent` inside OpenCode.
 
 Repository: `https://github.com/marcel-amorim/opencode-cursor-api-auth`
+Forked from: `https://github.com/POSO-PocketSolutions/opencode-cursor-auth`
 
-This plugin is for people who pay for Cursor (or have it paid for them) and want to use it from OpenCode with a Cursor API key.
+This plugin is for people who pay for Cursor (or have it paid for them) and want to use it from OpenCode without GitHub integration.
 
 ## Requirements
 
-- An active **Cursor Pro** subscription (or equivalent) to access Cursor Cloud Agents.
-- A Cursor API key from Cursor Dashboard -> Integrations.
+- An active **Cursor Pro** subscription (or equivalent).
+- `cursor-agent` installed and logged in.
 - `bun` installed.
 
 ## Important
 
-- This plugin uses Cursor Cloud Agents (`/v0/agents`) and requires a git repository with a reachable `origin` remote.
-- If your local checkout has no remote, set `CURSOR_SOURCE_REPOSITORY` and optionally `CURSOR_SOURCE_REF`.
+- This plugin uses local `cursor-agent`, so it does not depend on Cursor GitHub integration.
 
 ## Install bun (macOS/Linux)
 
@@ -40,16 +40,16 @@ npm install opencode-cursor-api-auth
   "provider": {
     "cursor": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "Cursor Cloud Agents API",
+      "name": "Cursor Agent (local)",
       "options": {
-        "baseURL": "https://api.cursor.com/v1",
-        "apiKey": "key_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "baseURL": "http://127.0.0.1:32123/v1"
       },
       "models": {
-        "auto": { "name": "Cursor Cloud Auto" },
-        "gpt-5.2": { "name": "Cursor GPT-5.2 High" },
-        "gpt-5.3-codex": { "name": "Cursor GPT-5.3 Codex High" },
-        "opus-4.6": { "name": "Cursor Opus 4.6 High Thinking" },
+        "auto": { "name": "Cursor Auto" },
+        "gpt-5": { "name": "Cursor GPT-5 (alias -> gpt-5.2)" },
+        "gpt-5.2": { "name": "Cursor GPT-5.2" },
+        "sonnet-4": { "name": "Cursor Sonnet 4 (alias -> sonnet-4.5)" },
+        "sonnet-4.5": { "name": "Cursor Sonnet 4.5" },
         "sonnet-4.5-thinking": { "name": "Cursor Sonnet 4.5 Thinking" }
       }
     }
@@ -65,7 +65,7 @@ opencode auth login
 
 - Select provider: `Other`
 - Provider id: `cursor`
-- Method: `Manually enter Cursor API key`
+- Method: `Login via cursor-agent (opens browser)`
 
 ## Run
 
@@ -76,8 +76,7 @@ opencode run "listame los archivos del repo" --model cursor/auto
 
 ## Notes
 
-- Tool-calling is best-effort via structured prompt instructions.
-- Cursor API key can be provided either in OpenCode auth login flow or in `provider.cursor.options.apiKey`.
+- Tool-calling is best-effort and works with OpenCode tools.
 
 ## License
 

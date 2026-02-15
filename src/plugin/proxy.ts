@@ -89,9 +89,12 @@ function createCursorAgentCommand(
   return [
     "cursor-agent",
     "--print",
+    "--approve-mcps",
+    "--trust",
+    "--force",
     "--output-format",
     stream ? "stream-json" : "text",
-    ...(stream ? ["--stream-partial-output", "--trust"] : []),
+    ...(stream ? ["--stream-partial-output"] : []),
     "--workspace",
     workspaceDirectory,
     "--model",
@@ -191,9 +194,57 @@ async function streamWithTools(
   let fullOutput = "";
   let accumulatedAssistant = "";
   let emittedThinking = false;
+  let lastThinkingChar = "";
   let thinkingFenceOpen = false;
   let thinkingPlanJsonOpen = false;
   let buffer = "";
+
+  const updateLastThinkingChar = (text: string) => {
+    for (let index = text.length - 1; index >= 0; index -= 1) {
+      const char = text[index];
+      if (!/\s/.test(char)) {
+        lastThinkingChar = char;
+        return;
+      }
+    }
+  };
+
+  const shouldPrefixThinkingSpace = (text: string): boolean => {
+    if (!emittedThinking || !text) {
+      return false;
+    }
+
+    if (/^\s/.test(text)) {
+      return false;
+    }
+
+    const firstChar = text[0];
+    if (!firstChar) {
+      return false;
+    }
+
+    if (!lastThinkingChar || /\s/.test(lastThinkingChar)) {
+      return false;
+    }
+
+    if (/[.,!?;:)]/.test(lastThinkingChar)) {
+      return true;
+    }
+
+    if (/[a-z]/.test(lastThinkingChar) && /[A-Z]/.test(firstChar)) {
+      return true;
+    }
+
+    if (/\d/.test(lastThinkingChar) && /[A-Za-z]/.test(firstChar)) {
+      return true;
+    }
+
+    if (/[A-Za-z]/.test(lastThinkingChar) && /\d/.test(firstChar)) {
+      return true;
+    }
+
+    return false;
+  };
 
   try {
     while (true) {
@@ -221,12 +272,18 @@ async function streamWithTools(
           const sanitized = sanitizeThinkingText(event.text, thinkingFenceOpen, thinkingPlanJsonOpen);
           thinkingFenceOpen = sanitized.inFence;
           thinkingPlanJsonOpen = sanitized.inPlanJson;
-          if (!sanitized.text.trim()) {
+          let thinkingChunk = sanitized.text.replace(/\*\*/g, "");
+          if (!thinkingChunk.trim()) {
             continue;
           }
 
-          const thinkingText = emittedThinking ? sanitized.text : `Thinking: ${sanitized.text}`;
+          if (shouldPrefixThinkingSpace(thinkingChunk)) {
+            thinkingChunk = ` ${thinkingChunk}`;
+          }
+
+          const thinkingText = emittedThinking ? thinkingChunk : `Thinking: ${thinkingChunk}`;
           emittedThinking = true;
+          updateLastThinkingChar(thinkingChunk);
           const chunkPayload = createChatCompletionChunk(id, created, selectedModel, thinkingText, false);
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunkPayload)}\n\n`));
           continue;
@@ -250,9 +307,15 @@ async function streamWithTools(
         const sanitized = sanitizeThinkingText(event.text, thinkingFenceOpen, thinkingPlanJsonOpen);
         thinkingFenceOpen = sanitized.inFence;
         thinkingPlanJsonOpen = sanitized.inPlanJson;
-        if (sanitized.text.trim()) {
-          const thinkingText = emittedThinking ? sanitized.text : `Thinking: ${sanitized.text}`;
+        let thinkingChunk = sanitized.text.replace(/\*\*/g, "");
+        if (thinkingChunk.trim()) {
+          if (shouldPrefixThinkingSpace(thinkingChunk)) {
+            thinkingChunk = ` ${thinkingChunk}`;
+          }
+
+          const thinkingText = emittedThinking ? thinkingChunk : `Thinking: ${thinkingChunk}`;
           emittedThinking = true;
+          updateLastThinkingChar(thinkingChunk);
           const chunkPayload = createChatCompletionChunk(id, created, selectedModel, thinkingText, false);
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunkPayload)}\n\n`));
         }

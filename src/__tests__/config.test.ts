@@ -9,7 +9,7 @@ describe("createCursorPluginConfigFromEnv", () => {
     expect(config.proxyHost).toBe("127.0.0.1");
     expect(config.proxyPort).toBe(32123);
     expect(config.logLevel).toBe("warn");
-    expect(config.modelAliases["gpt-5"]).toBe("gpt-5.2-high");
+    expect(config.modelAliases["gpt-5"]).toBe("gpt-5.2");
   });
 
   test("reads overrides from env", () => {
@@ -39,7 +39,7 @@ describe("createCursorPluginConfigFromEnv", () => {
       CURSOR_MODEL_ALIASES: "{" as unknown as string,
     } as NodeJS.ProcessEnv);
 
-    expect(config.modelAliases["gpt-5"]).toBe("gpt-5.2-high");
-    expect(config.modelAliases["sonnet-4.5-thinking"]).toBe("claude-4.5-sonnet-thinking");
+    expect(config.modelAliases["gpt-5"]).toBe("gpt-5.2");
+    expect(config.modelAliases["sonnet-4"]).toBe("sonnet-4.5");
   });
 });

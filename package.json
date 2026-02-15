@@ -1,7 +1,7 @@
 {
   "name": "opencode-cursor-api-auth",
   "version": "1.0.0",
-  "description": "OpenCode provider plugin for Cursor Cloud Agents API.",
+  "description": "OpenCode provider plugin for local cursor-agent auth.",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",

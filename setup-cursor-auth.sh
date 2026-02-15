@@ -6,11 +6,9 @@ echo "=== opencode-cursor-api-auth Setup ==="
 npm install
 npm run build
 
-if [ -n "$CURSOR_API_KEY" ]; then
-  echo "Validating CURSOR_API_KEY against Cursor API..."
-  curl --silent --show-error -u "$CURSOR_API_KEY:" https://api.cursor.com/v0/me >/dev/null
-  echo "Cursor API key is valid."
+if command -v cursor-agent >/dev/null 2>&1; then
+  echo "Checking cursor-agent login status..."
+  cursor-agent whoami || true
 else
-  echo "CURSOR_API_KEY is not set."
-  echo "Set it and rerun if you want automatic validation."
+  echo "cursor-agent is not installed or not in PATH."
 fi
