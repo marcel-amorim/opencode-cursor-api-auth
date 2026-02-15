@@ -13,6 +13,11 @@ describe("parseCursorStreamLine", () => {
         const result = parseCursorStreamLine(line);
         expect(result).toEqual({ type: "content", text: "Hello world" });
     });
+    test("parses assistant message events with multiple text parts", () => {
+        const line = '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hello"},{"type":"text","text":" world"}]}}';
+        const result = parseCursorStreamLine(line);
+        expect(result).toEqual({ type: "content", text: "Hello world" });
+    });
     test("parses final result events", () => {
         const line = '{"type":"result","subtype":"success","result":"Final output"}';
         const result = parseCursorStreamLine(line);
@@ -51,6 +56,19 @@ describe("parseCursorStreamLine", () => {
 describe("Cursor Proxy Integration", () => {
     let serverUrl;
     beforeAll(async () => {
+        const nativeFetch = globalThis.fetch.bind(globalThis);
+        spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+            const url = typeof input === "string"
+                ? input
+                : input instanceof URL
+                    ? input.toString()
+                    : input?.url || "";
+            if (typeof url === "string" && url.endsWith("/health")) {
+                return Promise.reject(new Error("skip shared health endpoint"));
+            }
+            return nativeFetch(input, init);
+        });
+        globalThis.__opencode_cursor_proxy_server__ = undefined;
         // Default mock implementation
         spyOn(Bun, "spawn").mockImplementation((options) => {
             const { cmd } = options;
@@ -58,6 +76,10 @@ describe("Cursor Proxy Integration", () => {
             const prompt = cmd[cmd.length - 1];
             // We use the prompt text to decide behavior
             const isToolCallRequest = typeof prompt === "string" && prompt.includes("USER: Call tool");
+            const isFallbackStreamRequest = typeof prompt === "string" && prompt.includes("USER: Fallback stream");
+            const isSnapshotDedupeRequest = typeof prompt === "string" && prompt.includes("USER: Snapshot dedupe");
+            const isThinkingFenceRequest = typeof prompt === "string" && prompt.includes("USER: Thinking fence");
+            const isThinkingSplitJsonRequest = typeof prompt === "string" && prompt.includes("USER: Thinking split json");
             const stream = new ReadableStream({
                 start(controller) {
                     if (isToolCallRequest) {
@@ -75,6 +97,78 @@ describe("Cursor Proxy Integration", () => {
                             type: "result",
                             subtype: "success",
                             result: toolCallJson
+                        }) + "\n"));
+                    }
+                    else if (isFallbackStreamRequest) {
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "thinking",
+                            text: "Fallback thinking..."
+                        }) + "\n"));
+                        controller.enqueue(new TextEncoder().encode('{action:final,content:Fallback final output}\n'));
+                    }
+                    else if (isSnapshotDedupeRequest) {
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "thinking",
+                            subtype: "delta",
+                            text: "Dedupe thinking..."
+                        }) + "\n"));
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "assistant",
+                            message: {
+                                role: "assistant",
+                                content: [{ type: "text", text: "Recursion is" }]
+                            }
+                        }) + "\n"));
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "assistant",
+                            message: {
+                                role: "assistant",
+                                content: [{ type: "text", text: "Recursion is concise." }]
+                            }
+                        }) + "\n"));
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "result",
+                            subtype: "success",
+                            result: '{"action":"final","content":"Recursion is concise."}'
+                        }) + "\n"));
+                    }
+                    else if (isThinkingFenceRequest) {
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "thinking",
+                            subtype: "delta",
+                            text: "```json\n{\"action\":\"final\",\"content\":\"leak\"}\n```"
+                        }) + "\n"));
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "thinking",
+                            subtype: "delta",
+                            text: "Providing concise recursion explanation"
+                        }) + "\n"));
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "result",
+                            subtype: "success",
+                            result: '{"action":"final","content":"Recursion final sentence."}'
+                        }) + "\n"));
+                    }
+                    else if (isThinkingSplitJsonRequest) {
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "thinking",
+                            subtype: "delta",
+                            text: '{"action":"final","content":"Recursion is'
+                        }) + "\n"));
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "thinking",
+                            subtype: "delta",
+                            text: ' a process."}'
+                        }) + "\n"));
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "thinking",
+                            subtype: "delta",
+                            text: "Providing concise recursion explanation"
+                        }) + "\n"));
+                        controller.enqueue(new TextEncoder().encode(JSON.stringify({
+                            type: "result",
+                            subtype: "success",
+                            result: '{"action":"final","content":"Split final sentence."}'
                         }) + "\n"));
                     }
                     else {
@@ -110,7 +204,7 @@ describe("Cursor Proxy Integration", () => {
         });
         serverUrl = await ensureCursorProxyServer("/tmp");
     });
-    test("streams thinking and content correctly", async () => {
+    test("streams thinking and resolves final content once", async () => {
         const response = await fetch(`${serverUrl}/chat/completions`, {
             method: "POST",
             body: JSON.stringify({
@@ -126,14 +220,18 @@ describe("Cursor Proxy Integration", () => {
         const reader = response.body?.getReader();
         const decoder = new TextDecoder();
         let result = "";
+        expect(reader).toBeDefined();
+        if (!reader)
+            throw new Error("Missing response body");
         while (true) {
-            const { done, value } = await reader?.read();
+            const { done, value } = await reader.read();
             if (done)
                 break;
             result += decoder.decode(value);
         }
-        expect(result).toContain('"delta":{"content":"Thinking process..."}');
-        expect(result).toContain('"delta":{"content":"Hello from mock!"}');
+        expect(result).toContain('"delta":{"content":"Thinking: Thinking process..."}');
+        expect(result).toContain('"delta":{"content":"\\n\\nFinal result text"}');
+        expect(result).not.toContain('"delta":{"content":"Hello from mock!"}');
         expect(result).toContain("[DONE]");
     });
     test("handles tool calls correctly", async () => {
@@ -149,15 +247,126 @@ describe("Cursor Proxy Integration", () => {
         const reader = response.body?.getReader();
         const decoder = new TextDecoder();
         let result = "";
+        expect(reader).toBeDefined();
+        if (!reader)
+            throw new Error("Missing response body");
         while (true) {
-            const { done, value } = await reader?.read();
+            const { done, value } = await reader.read();
             if (done)
                 break;
             result += decoder.decode(value);
         }
-        expect(result).toContain('"delta":{"content":"Deciding to use tool..."}');
+        expect(result).toContain('"delta":{"content":"Thinking: Deciding to use tool..."}');
         expect(result).toContain('"tool_calls":[{"index":0,"id":');
         expect(result).toContain('"name":"test_tool"');
+        expect(result).toContain('[DONE]');
+    });
+    test("handles fallback stream formats", async () => {
+        const response = await fetch(`${serverUrl}/chat/completions`, {
+            method: "POST",
+            body: JSON.stringify({
+                model: "gpt-4",
+                messages: [{ role: "user", content: "Fallback stream" }],
+                stream: true,
+                tools: [{ type: "function", function: { name: "test_tool" } }]
+            }),
+        });
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+        let result = "";
+        expect(reader).toBeDefined();
+        if (!reader)
+            throw new Error("Missing response body");
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done)
+                break;
+            result += decoder.decode(value);
+        }
+        expect(result).toContain('"delta":{"content":"Thinking: Fallback thinking..."}');
+        expect(result).toContain('"delta":{"content":"\\n\\nFallback final output"}');
+        expect(result).toContain('[DONE]');
+    });
+    test("does not leak plan snapshots to output", async () => {
+        const response = await fetch(`${serverUrl}/chat/completions`, {
+            method: "POST",
+            body: JSON.stringify({
+                model: "gpt-4",
+                messages: [{ role: "user", content: "Snapshot dedupe" }],
+                stream: true,
+                tools: [{ type: "function", function: { name: "test_tool" } }]
+            }),
+        });
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+        let result = "";
+        expect(reader).toBeDefined();
+        if (!reader)
+            throw new Error("Missing response body");
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done)
+                break;
+            result += decoder.decode(value);
+        }
+        expect(result).toContain('"delta":{"content":"\\n\\nRecursion is concise."}');
+        expect(result).not.toContain('"delta":{"content":"{\\"action\\":\\"final\\"');
+        expect(result).toContain('[DONE]');
+    });
+    test("strips fenced plan JSON from thinking output", async () => {
+        const response = await fetch(`${serverUrl}/chat/completions`, {
+            method: "POST",
+            body: JSON.stringify({
+                model: "gpt-4",
+                messages: [{ role: "user", content: "Thinking fence" }],
+                stream: true,
+                tools: [{ type: "function", function: { name: "test_tool" } }]
+            }),
+        });
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+        let result = "";
+        expect(reader).toBeDefined();
+        if (!reader)
+            throw new Error("Missing response body");
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done)
+                break;
+            result += decoder.decode(value);
+        }
+        expect(result).toContain('"delta":{"content":"Thinking: Providing concise recursion explanation"}');
+        expect(result).not.toContain('```json');
+        expect(result).not.toContain('"action":"final"');
+        expect(result).toContain('"delta":{"content":"\\n\\nRecursion final sentence."}');
+        expect(result).toContain('[DONE]');
+    });
+    test("strips split plan JSON from thinking output", async () => {
+        const response = await fetch(`${serverUrl}/chat/completions`, {
+            method: "POST",
+            body: JSON.stringify({
+                model: "gpt-4",
+                messages: [{ role: "user", content: "Thinking split json" }],
+                stream: true,
+                tools: [{ type: "function", function: { name: "test_tool" } }]
+            }),
+        });
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+        let result = "";
+        expect(reader).toBeDefined();
+        if (!reader)
+            throw new Error("Missing response body");
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done)
+                break;
+            result += decoder.decode(value);
+        }
+        expect(result).toContain('"delta":{"content":"Thinking: Providing concise recursion explanation"}');
+        expect(result).not.toContain('"delta":{"content":"Thinking: {"');
+        expect(result).not.toContain('"action":"final"');
+        expect(result).toContain('"delta":{"content":"\\n\\nSplit final sentence."}');
         expect(result).toContain('[DONE]');
     });
 });

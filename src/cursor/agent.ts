@@ -3,6 +3,10 @@ import path from "node:path";
 import os from "node:os";
 import { decodeJWT } from "../utils/jwt.js";
 import type { CursorAuthResult } from "./types.js";
+import { CursorStorageError } from "../plugin/errors.js";
+import { createLogger } from "../utils/logger.js";
+
+const log = createLogger("agent-auth");
 
 function getAgentAuthPath(): string {
   const platform = os.platform();
@@ -10,21 +14,23 @@ function getAgentAuthPath(): string {
   const domain = "cursor";
 
   switch (platform) {
-    case "win32":
+    case "win32": {
       const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
       return path.join(appData, "Cursor", "auth.json");
+    }
     case "darwin":
       return path.join(home, ".cursor", "auth.json");
     case "linux":
-    default:
+    default: {
       const configDir = process.env.XDG_CONFIG_HOME || path.join(home, ".config");
       return path.join(configDir, domain, "auth.json");
+    }
   }
 }
 
 export async function loginAgent(): Promise<CursorAuthResult> {
   const authPath = getAgentAuthPath();
-  
+
   if (!fs.existsSync(authPath)) {
     return {
       type: "failed",
@@ -34,7 +40,7 @@ export async function loginAgent(): Promise<CursorAuthResult> {
 
   try {
     const content = fs.readFileSync(authPath, "utf-8");
-    const data = JSON.parse(content);
+    const data = JSON.parse(content) as { accessToken?: string; refreshToken?: string };
 
     if (!data.accessToken) {
       return {
@@ -67,9 +73,13 @@ export async function loginAgent(): Promise<CursorAuthResult> {
     };
 
   } catch (error) {
+    const wrappedError = new CursorStorageError(`Failed to read agent auth file`, authPath, {
+      cause: error instanceof Error ? error.message : String(error),
+    });
+    log.warn("Agent auth lookup failed", { path: authPath, message: wrappedError.message });
     return {
       type: "failed",
-      error: `Failed to read agent auth file: ${error instanceof Error ? error.message : String(error)}`,
+      error: wrappedError.message,
     };
   }
 }

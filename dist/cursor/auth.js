@@ -1,21 +1,37 @@
 import { loginLocal } from "./local.js";
 import { loginAgent } from "./agent.js";
+import { CursorAuthError } from "../plugin/errors.js";
+import { createLogger } from "../utils/logger.js";
+const log = createLogger("auth");
+function toFailureReason(reason) {
+    return reason && reason.trim().length > 0 ? reason.trim() : "Unknown error";
+}
+export function buildAuthFailureMessage(localError, agentError) {
+    return [
+        "No authentication found.",
+        `Checked Local DB: ${toFailureReason(localError)}`,
+        `Checked Agent Config: ${toFailureReason(agentError)}`,
+    ].join("\n");
+}
 export async function getCursorAuth() {
-    // 1. Try Local DB (IDE)
     const localResult = await loginLocal();
     if (localResult.type === "success") {
+        log.debug("Authenticated via local Cursor database", { source: localResult.source });
         return localResult;
     }
-    // 2. Try Agent Config
     const agentResult = await loginAgent();
     if (agentResult.type === "success") {
+        log.debug("Authenticated via cursor-agent auth file", { source: agentResult.source });
         return agentResult;
     }
+    const error = new CursorAuthError(buildAuthFailureMessage(localResult.error, agentResult.error), {
+        localError: localResult.error,
+        agentError: agentResult.error,
+    });
+    log.warn("Authentication lookup failed", { error: error.message });
     return {
         type: "failed",
-        error: `No authentication found. 
-    Checked Local DB: ${localResult.error}
-    Checked Agent Config: ${agentResult.error}`
+        error: error.message,
     };
 }
 //# sourceMappingURL=auth.js.map

@@ -1,7 +1,10 @@
 import fs from "node:fs";
+import { CursorStorageError } from "../plugin/errors.js";
+import { createLogger } from "./logger.js";
+
+const log = createLogger("db");
 
 function isBunRuntime(): boolean {
-  // Bun exposes globalThis.Bun and process.versions.bun
   return (
     typeof (globalThis as any).Bun !== "undefined" ||
     typeof (process as any)?.versions?.bun === "string"
@@ -14,8 +17,6 @@ export async function getDbValue(dbPath: string, key: string): Promise<string | 
   }
 
   try {
-    // Bun runtime (used by opencode) cannot load native Node addons (.node)
-    // so we prefer bun:sqlite.
     if (isBunRuntime()) {
       const mod = await import("bun:sqlite");
       const Database = (mod as any).Database as any;
@@ -27,7 +28,6 @@ export async function getDbValue(dbPath: string, key: string): Promise<string | 
       return row?.value ?? null;
     }
 
-    // Node runtime (optional): use better-sqlite3 if available.
     const mod = await import("better-sqlite3");
     const Database = ((mod as any).default ?? mod) as any;
     const db = new Database(dbPath, { readonly: true });
@@ -36,9 +36,15 @@ export async function getDbValue(dbPath: string, key: string): Promise<string | 
     db.close();
     return row?.value ?? null;
   } catch (error) {
-    // Avoid noisy stacks during auth; treat as "no token".
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[Cursor Auth] Failed to read Cursor DB at ${dbPath}: ${message}`);
+    const wrappedError = new CursorStorageError("Failed to read Cursor DB", dbPath, {
+      cause: error instanceof Error ? error.message : String(error),
+      key,
+    });
+    log.warn(wrappedError.message, {
+      path: dbPath,
+      key,
+      code: wrappedError.code,
+    });
     return null;
   }
 }

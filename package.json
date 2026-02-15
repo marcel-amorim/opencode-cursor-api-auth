@@ -1,18 +1,18 @@
 {
-  "name": "opencode-cursor-auth",
-  "version": "1.0.17",
-  "description": "Authentication provider for Cursor, extracting credentials from local environment or agent.",
+  "name": "opencode-cursor-api-auth",
+  "version": "1.0.0",
+  "description": "OpenCode provider plugin for Cursor Cloud Agents API.",
   "type": "module",
   "main": "dist/index.js",
   "module": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "bun test"
+    "test": "bun test src"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/POSO-PocketSolutions/opencode-cursor-auth.git"
+    "url": "https://github.com/marcel-amorim/opencode-cursor-api-auth.git"
   },
   "keywords": [
     "cursor",

@@ -1,185 +1,166 @@
-const CURSOR_PROVIDER_ID = "cursor";
-// Local proxy server that translates OpenAI-compatible HTTP to cursor-agent CLI.
-const CURSOR_PROXY_HOST = "127.0.0.1";
-const CURSOR_PROXY_DEFAULT_PORT = 32123;
-const CURSOR_PROXY_DEFAULT_BASE_URL = `http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/v1`;
-function openAIError(status, message, details) {
-    const body = {
-        error: {
-            message: details ? `${message}\n${details}` : message,
-            type: "cursor_agent_error",
-            param: null,
-            code: null,
-        },
-    };
-    return new Response(JSON.stringify(body), {
-        status,
-        headers: { "Content-Type": "application/json" },
-    });
+import { Buffer } from "node:buffer";
+import { execFileSync } from "node:child_process";
+import { CURSOR_PROVIDER_ID } from "./constants.js";
+import { getCursorPluginConfig } from "./config/loader.js";
+import { createChatCompletionChunk, createChatCompletionResponse, createToolCallsCompletionResponse, openAIError, } from "./plugin/openai.js";
+import { ensureCursorProxyServer } from "./plugin/proxy.js";
+import { parseCursorStreamLine } from "./plugin/stream.js";
+import { buildToolCallingPrompt, extractPromptFromChatCompletions, normalizeCursorAgentModel, parseToolCallPlan, } from "./plugin/tooling.js";
+import { createLogger } from "./utils/logger.js";
+const log = createLogger("plugin");
+const TERMINAL_AGENT_STATUSES = new Set(["FINISHED", "FAILED", "STOPPED", "CANCELLED", "ERRORED", "ERROR"]);
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
-function normalizeCursorAgentModel(model) {
-    if (!model)
-        return "auto";
-    const aliases = {
-        "gpt-5": "gpt-5.2",
-        "sonnet-4": "sonnet-4.5",
-    };
-    return aliases[model] || model;
+function trimTrailingSlash(value) {
+    return value.replace(/\/+$/, "");
 }
-function summarizeTool(tool) {
-    const name = tool?.function?.name || "unknown";
-    const description = tool?.function?.description || "";
-    const params = tool?.function?.parameters;
-    let paramsSummary = "";
-    if (params && typeof params === "object") {
-        const props = params.properties && typeof params.properties === "object" ? Object.keys(params.properties) : [];
-        const required = Array.isArray(params.required) ? params.required : [];
-        paramsSummary = `args: { ${props.join(", ")} } required: [${required.join(", ")}]`;
+function toUrlString(input) {
+    if (typeof input === "string") {
+        return input;
     }
-    return `- ${name}${description ? `: ${description}` : ""}${paramsSummary ? ` (${paramsSummary})` : ""}`;
-}
-function extractPromptFromChatCompletions(body) {
-    const model = typeof body?.model === "string" ? body.model : undefined;
-    const stream = body?.stream === true;
-    const tools = Array.isArray(body?.tools) ? body.tools : [];
-    const messages = Array.isArray(body?.messages) ? body.messages : [];
-    const lines = [];
-    for (const message of messages) {
-        const role = typeof message.role === "string" ? message.role : "user";
-        if (role === "tool") {
-            const name = typeof message.name === "string" ? message.name : "tool";
-            const toolCallId = typeof message.tool_call_id === "string" ? message.tool_call_id : "";
-            const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
-            lines.push(`TOOL RESULT (${name}${toolCallId ? `, id=${toolCallId}` : ""}): ${content}`);
-            continue;
-        }
-        if (role === "assistant" && Array.isArray(message.tool_calls)) {
-            lines.push(`ASSISTANT TOOL_CALLS: ${JSON.stringify(message.tool_calls)}`);
-            continue;
-        }
-        const content = message.content;
-        if (typeof content === "string") {
-            lines.push(`${role.toUpperCase()}: ${content}`);
-            continue;
-        }
-        if (Array.isArray(content)) {
-            const textParts = content
-                .map((part) => {
-                if (part && typeof part === "object" && part.type === "text" && typeof part.text === "string") {
-                    return part.text;
-                }
-                return "";
-            })
-                .filter(Boolean);
-            if (textParts.length) {
-                lines.push(`${role.toUpperCase()}: ${textParts.join("\n")}`);
-            }
-            continue;
-        }
+    if (input instanceof URL) {
+        return input.toString();
     }
-    return { prompt: lines.join("\n\n"), model, stream, tools };
+    return input.url;
 }
-export function parseCursorStreamLine(line) {
-    if (!line || typeof line !== "string")
-        return null;
+function isChatCompletionsRequest(input) {
+    const raw = toUrlString(input);
     try {
-        const data = JSON.parse(line);
-        // 1. Thinking delta
-        if (data.type === "thinking") {
-            if (data.subtype === "delta" && typeof data.text === "string") {
-                return { type: "thinking", text: data.text };
-            }
-            return null;
-        }
-        // 2. Assistant message
-        if (data.type === "assistant") {
-            if (data.message?.role === "assistant" &&
-                Array.isArray(data.message.content) &&
-                data.message.content.length > 0) {
-                const firstPart = data.message.content[0];
-                if (firstPart.type === "text" && typeof firstPart.text === "string") {
-                    return { type: "content", text: firstPart.text };
-                }
-            }
-            return null;
-        }
-        // 3. Result
-        if (data.type === "result") {
-            if (typeof data.result === "string") {
-                return { type: "result", text: data.result };
-            }
-            return null;
-        }
-        return null;
+        return new URL(raw).pathname.endsWith("/chat/completions");
     }
     catch {
-        return null;
+        return raw.includes("/chat/completions");
     }
 }
-function parseToolCallPlan(output) {
-    const start = output.indexOf("{");
-    const end = output.lastIndexOf("}");
-    if (start === -1 || end === -1 || end <= start)
-        return null;
-    const jsonText = output.slice(start, end + 1);
+function buildBasicAuthHeader(apiKey) {
+    return `Basic ${Buffer.from(`${apiKey}:`, "utf8").toString("base64")}`;
+}
+function resolveApiKey(auth) {
+    if (auth && typeof auth === "object") {
+        const typed = auth;
+        if (typed.type === "api_key" && typeof typed.key === "string" && typed.key.trim().length > 0) {
+            return typed.key.trim();
+        }
+    }
+    const envKey = process.env.CURSOR_API_KEY;
+    if (typeof envKey === "string" && envKey.trim().length > 0) {
+        return envKey.trim();
+    }
+    return undefined;
+}
+function extractApiKeyFromRequestInit(init) {
+    const headers = new Headers(init?.headers ?? {});
+    const explicitApiKey = headers.get("x-api-key");
+    if (explicitApiKey && explicitApiKey.trim().length > 0) {
+        return explicitApiKey.trim();
+    }
+    const authorization = headers.get("authorization");
+    if (!authorization) {
+        return undefined;
+    }
+    if (authorization.toLowerCase().startsWith("bearer ")) {
+        const token = authorization.slice(7).trim();
+        return token.length > 0 ? token : undefined;
+    }
+    if (authorization.toLowerCase().startsWith("basic ")) {
+        const encoded = authorization.slice(6).trim();
+        try {
+            const decoded = Buffer.from(encoded, "base64").toString("utf8");
+            const key = decoded.split(":", 1)[0]?.trim();
+            return key && key.length > 0 ? key : undefined;
+        }
+        catch {
+            return undefined;
+        }
+    }
+    return undefined;
+}
+function normalizeRepositoryUrl(raw) {
+    const value = raw.trim();
+    if (value.startsWith("git@github.com:")) {
+        const repo = value.replace("git@github.com:", "").replace(/\.git$/, "");
+        return `https://github.com/${repo}`;
+    }
+    if (value.startsWith("ssh://git@github.com/")) {
+        const repo = value.replace("ssh://git@github.com/", "").replace(/\.git$/, "");
+        return `https://github.com/${repo}`;
+    }
+    return value.replace(/\.git$/, "");
+}
+function readGitValue(workspaceDirectory, args) {
     try {
-        const parsed = JSON.parse(jsonText);
-        if (parsed && parsed.action === "final" && typeof parsed.content === "string") {
-            return { action: "final", content: parsed.content };
-        }
-        if (parsed && parsed.action === "tool_call" && Array.isArray(parsed.tool_calls)) {
-            return {
-                action: "tool_call",
-                tool_calls: parsed.tool_calls
-                    .filter((t) => t && typeof t.name === "string")
-                    .map((t) => ({ name: t.name, arguments: t.arguments ?? {} })),
-            };
-        }
-        return null;
+        const output = execFileSync("git", ["-C", workspaceDirectory, ...args], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "ignore"],
+        });
+        const value = output.trim();
+        return value.length > 0 ? value : undefined;
     }
     catch {
-        return null;
+        return undefined;
     }
 }
-function buildToolCallingPrompt(conversation, tools, workspaceDirectory) {
-    const toolList = tools.length ? tools.map(summarizeTool).join("\n") : "(none)";
-    return [
-        "You are a tool-calling assistant running inside OpenCode.",
-        `Workspace directory: ${workspaceDirectory}`,
-        "",
-        "Available tools:",
-        toolList,
-        "",
-        "STRICT OUTPUT:",
-        "- Output MUST be exactly one JSON object and nothing else.",
-        "- If you output anything outside JSON, your answer is discarded.",
-        "",
-        "RESPONSE FORMAT:",
-        "- Call tool(s):",
-        '{"action":"tool_call","tool_calls":[{"name":"list","arguments":{"path":"/ABSOLUTE/PATH"}}]}',
-        "- Final answer:",
-        '{"action":"final","content":"..."}',
-        "",
-        "Task:",
-        conversation,
-    ].join("\n");
+function hasRemoteBranch(workspaceDirectory, ref) {
+    const value = readGitValue(workspaceDirectory, ["ls-remote", "--heads", "origin", ref]);
+    return typeof value === "string" && value.length > 0;
 }
-function createChatCompletionResponse(model, content) {
+function resolveSource(workspaceDirectory, sourceRepository, sourceRef) {
+    const repository = sourceRepository?.trim() || readGitValue(workspaceDirectory, ["remote", "get-url", "origin"]);
+    if (!repository) {
+        return null;
+    }
+    const explicitRef = sourceRef?.trim();
+    const detectedRef = readGitValue(workspaceDirectory, ["rev-parse", "--abbrev-ref", "HEAD"]);
+    let ref = explicitRef || detectedRef;
+    if (!explicitRef && ref && ref !== "HEAD" && !hasRemoteBranch(workspaceDirectory, ref)) {
+        log.warn("Local branch is not available on remote; using repository default branch", { ref });
+        ref = undefined;
+    }
     return {
-        id: `cursor-agent-${Date.now()}`,
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [
-            {
-                index: 0,
-                message: { role: "assistant", content },
-                finish_reason: "stop",
-            },
-        ],
+        source: {
+            repository: normalizeRepositoryUrl(repository),
+            ref: ref === "HEAD" ? undefined : ref,
+        },
+        refIsExplicit: Boolean(explicitRef),
     };
 }
-function createChatCompletionChunk(id, created, model, deltaContent, done = false) {
+function isBranchVerificationError(details) {
+    const lowered = details.toLowerCase();
+    return lowered.includes("verify existence of branch") || lowered.includes("branch name is correct");
+}
+async function cursorApiRequest(apiBaseUrl, apiKey, path, init) {
+    const headers = new Headers(init?.headers ?? {});
+    headers.set("Authorization", buildBasicAuthHeader(apiKey));
+    const response = await fetch(`${trimTrailingSlash(apiBaseUrl)}${path}`, {
+        ...init,
+        headers,
+    });
+    const text = await response.text();
+    if (!text.trim()) {
+        return { response, data: null, text };
+    }
+    try {
+        return { response, data: JSON.parse(text), text };
+    }
+    catch {
+        return { response, data: null, text };
+    }
+}
+function extractAssistantMessage(conversation) {
+    const messages = conversation?.messages;
+    if (!Array.isArray(messages)) {
+        return "";
+    }
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message?.type === "assistant_message" && typeof message.text === "string" && message.text.trim().length > 0) {
+            return message.text.trim();
+        }
+    }
+    return "";
+}
+function buildToolCallsChunk(id, created, model, toolCalls) {
     return {
         id,
         object: "chat.completion.chunk",
@@ -188,388 +169,206 @@ function createChatCompletionChunk(id, created, model, deltaContent, done = fals
         choices: [
             {
                 index: 0,
-                delta: deltaContent ? { content: deltaContent } : {},
-                finish_reason: done ? "stop" : null,
+                delta: {
+                    role: "assistant",
+                    tool_calls: toolCalls.map((toolCall, index) => ({
+                        index,
+                        id: `call_${Date.now()}_${index}`,
+                        type: "function",
+                        function: {
+                            name: toolCall.name,
+                            arguments: JSON.stringify(toolCall.arguments ?? {}),
+                        },
+                    })),
+                },
+                finish_reason: "tool_calls",
             },
         ],
     };
 }
-function getGlobalKey() {
-    return "__opencode_cursor_proxy_server__";
-}
-export async function ensureCursorProxyServer(workspaceDirectory) {
-    const key = getGlobalKey();
-    const g = globalThis;
-    const existingBaseURL = g[key]?.baseURL;
-    if (typeof existingBaseURL === "string" && existingBaseURL.length > 0) {
-        return existingBaseURL;
+async function runCloudAgent(workspaceDirectory, apiBaseUrl, apiKey, model, prompt, tools) {
+    const config = getCursorPluginConfig();
+    const resolvedSource = resolveSource(workspaceDirectory, config.sourceRepository, config.sourceRef);
+    if (!resolvedSource) {
+        throw new Error("Could not resolve source repository. Set CURSOR_SOURCE_REPOSITORY or configure git remote origin.");
     }
-    // Mark as starting to avoid duplicate starts in-process.
-    g[key] = { baseURL: "" };
-    const handler = async (req) => {
-        try {
-            const url = new URL(req.url);
-            if (url.pathname === "/health") {
-                return new Response(JSON.stringify({ ok: true }), {
-                    status: 200,
-                    headers: { "Content-Type": "application/json" },
-                });
-            }
-            if (url.pathname !== "/v1/chat/completions" && url.pathname !== "/chat/completions") {
-                return openAIError(404, `Unsupported path: ${url.pathname}`);
-            }
-            const body = await req.json().catch(() => ({}));
-            const { prompt, model, stream, tools } = extractPromptFromChatCompletions(body);
-            let selectedModel = normalizeCursorAgentModel(model);
-            // When tool-calling is enabled and model is "auto", pick a strict model.
-            if (tools.length && selectedModel === "auto") {
-                selectedModel = "sonnet-4.5-thinking";
-            }
-            const effectivePrompt = tools.length ? buildToolCallingPrompt(prompt, tools, workspaceDirectory) : prompt;
-            const bunAny = globalThis;
-            if (!bunAny.Bun?.spawn) {
-                return openAIError(500, "This provider requires Bun runtime.");
-            }
-            const cmd = [
-                "cursor-agent",
-                "--print",
-                "--output-format",
-                stream ? "stream-json" : "text",
-                ...(stream ? ["--stream-partial-output", "--trust"] : []),
-                "--workspace",
-                workspaceDirectory,
-                "--model",
-                selectedModel,
-                effectivePrompt,
-            ];
-            const child = bunAny.Bun.spawn({
-                cmd,
-                stdout: "pipe",
-                stderr: "pipe",
-                env: bunAny.Bun.env,
-            });
-            if (!stream) {
-                const [stdoutText, stderrText] = await Promise.all([
-                    new Response(child.stdout).text(),
-                    new Response(child.stderr).text(),
-                ]);
-                const stdout = (stdoutText || "").trim();
-                const stderr = (stderrText || "").trim();
-                // If tools were requested and we can parse a plan, treat it as success even if exitCode != 0.
-                const plan = tools.length ? parseToolCallPlan(stdout) : null;
-                if (plan?.action === "tool_call") {
-                    const toolCalls = plan.tool_calls.map((tc, i) => ({
-                        id: `call_${Date.now()}_${i}`,
-                        type: "function",
-                        function: {
-                            name: tc.name,
-                            arguments: JSON.stringify(tc.arguments ?? {}),
-                        },
-                    }));
-                    const payload = {
-                        id: `cursor-agent-${Date.now()}`,
-                        object: "chat.completion",
-                        created: Math.floor(Date.now() / 1000),
-                        model: selectedModel,
-                        choices: [
-                            {
-                                index: 0,
-                                message: {
-                                    role: "assistant",
-                                    content: "",
-                                    tool_calls: toolCalls,
-                                },
-                                finish_reason: "tool_calls",
-                            },
-                        ],
-                    };
-                    return new Response(JSON.stringify(payload), {
-                        status: 200,
-                        headers: { "Content-Type": "application/json" },
-                    });
-                }
-                if (plan?.action === "final") {
-                    const payload = createChatCompletionResponse(selectedModel, plan.content);
-                    return new Response(JSON.stringify(payload), {
-                        status: 200,
-                        headers: { "Content-Type": "application/json" },
-                    });
-                }
-                // cursor-agent sometimes returns non-zero even with usable stdout.
-                // Treat stdout as success unless we have explicit stderr.
-                if (child.exitCode !== 0 && stderr.length > 0) {
-                    return openAIError(401, "cursor-agent failed.", stderr);
-                }
-                const payload = createChatCompletionResponse(selectedModel, stdout || stderr);
-                return new Response(JSON.stringify(payload), {
-                    status: 200,
-                    headers: { "Content-Type": "application/json" },
-                });
-            }
-            // Streaming.
-            const encoder = new TextEncoder();
-            const id = `cursor-agent-${Date.now()}`;
-            const created = Math.floor(Date.now() / 1000);
-            const sse = new ReadableStream({
-                async start(controller) {
-                    let closed = false;
-                    try {
-                        // Tool-calling + streaming: buffer stdout to decide whether to emit tool_calls.
-                        if (tools.length) {
-                            // Keep the SSE connection alive while cursor-agent thinks.
-                            const heartbeat = () => {
-                                if (closed)
-                                    return;
-                                try {
-                                    const pingChunk = createChatCompletionChunk(id, created, selectedModel, "", false);
-                                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(pingChunk)}\n\n`));
-                                }
-                                catch {
-                                    // ignore
-                                }
-                            };
-                            heartbeat();
-                            const interval = setInterval(heartbeat, 1000);
-                            const decoder = new TextDecoder();
-                            const reader = child.stdout.getReader();
-                            let fullOutput = "";
-                            let accumulatedAssistant = "";
-                            let buffer = "";
-                            try {
-                                while (true) {
-                                    const { value, done } = await reader.read();
-                                    if (done)
-                                        break;
-                                    const chunk = decoder.decode(value, { stream: true });
-                                    buffer += chunk;
-                                    const lines = buffer.split("\n");
-                                    buffer = lines.pop() || "";
-                                    for (const line of lines) {
-                                        if (!line.trim())
-                                            continue;
-                                        const event = parseCursorStreamLine(line);
-                                        if (!event)
-                                            continue;
-                                        if (event.type === "thinking") {
-                                            const chunk = createChatCompletionChunk(id, created, selectedModel, event.text, false);
-                                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                                        }
-                                        else if (event.type === "content") {
-                                            accumulatedAssistant += event.text;
-                                            const chunk = createChatCompletionChunk(id, created, selectedModel, event.text, false);
-                                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                                        }
-                                        else if (event.type === "result") {
-                                            // Result typically contains the full text.
-                                            // If we haven't streamed anything (e.g. no assistant events), we could stream this.
-                                            // But to be safe and avoid duplication, we just use it for fullOutput.
-                                            fullOutput = event.text;
-                                        }
-                                    }
-                                }
-                                // Process remaining buffer
-                                if (buffer.trim()) {
-                                    const event = parseCursorStreamLine(buffer);
-                                    if (event) {
-                                        if (event.type === "thinking") {
-                                            const chunk = createChatCompletionChunk(id, created, selectedModel, event.text, false);
-                                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                                        }
-                                        else if (event.type === "content") {
-                                            accumulatedAssistant += event.text;
-                                            const chunk = createChatCompletionChunk(id, created, selectedModel, event.text, false);
-                                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                                        }
-                                        else if (event.type === "result") {
-                                            fullOutput = event.text;
-                                        }
-                                    }
-                                }
-                            }
-                            finally {
-                                clearInterval(interval);
-                            }
-                            // Fallback if no result event was seen, use accumulated assistant text
-                            if (!fullOutput && accumulatedAssistant) {
-                                fullOutput = accumulatedAssistant;
-                            }
-                            const plan = parseToolCallPlan(fullOutput);
-                            if (plan?.action === "tool_call") {
-                                const toolCalls = plan.tool_calls.map((tc, i) => ({
-                                    index: i,
-                                    id: `call_${Date.now()}_${i}`,
-                                    type: "function",
-                                    function: {
-                                        name: tc.name,
-                                        arguments: JSON.stringify(tc.arguments ?? {}),
-                                    },
-                                }));
-                                const chunk = {
-                                    id,
-                                    object: "chat.completion.chunk",
-                                    created,
-                                    model: selectedModel,
-                                    choices: [
-                                        {
-                                            index: 0,
-                                            delta: {
-                                                role: "assistant",
-                                                tool_calls: toolCalls,
-                                            },
-                                            finish_reason: "tool_calls",
-                                        },
-                                    ],
-                                };
-                                controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                                return;
-                            }
-                            const content = plan?.action === "final" ? plan.content : "";
-                            // If we already streamed the content via assistant events, we don't need to send it again.
-                            // But we do need to send a final stop chunk.
-                            // However, if the parsed content is DIFFERENT from what we accumulated (e.g. result event had more),
-                            // we might need to send the diff?
-                            // Current safe approach: if we streamed 'accumulatedAssistant', and 'content' is roughly same, done.
-                            // If 'content' is present but 'accumulatedAssistant' is empty, send content.
-                            if (!accumulatedAssistant && content) {
-                                const finalChunk = createChatCompletionChunk(id, created, selectedModel, content, true);
-                                controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`));
-                            }
-                            else {
-                                const doneChunk = createChatCompletionChunk(id, created, selectedModel, "", true);
-                                controller.enqueue(encoder.encode(`data: ${JSON.stringify(doneChunk)}\n\n`));
-                            }
-                            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                            return;
-                        }
-                        // No tools: stream stdout as text deltas.
-                        const decoder = new TextDecoder();
-                        const reader = child.stdout.getReader();
-                        while (true) {
-                            const { value, done } = await reader.read();
-                            if (done)
-                                break;
-                            if (!value || value.length === 0)
-                                continue;
-                            const text = decoder.decode(value, { stream: true });
-                            if (!text)
-                                continue;
-                            const chunk = createChatCompletionChunk(id, created, selectedModel, text, false);
-                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-                        }
-                        if (child.exitCode !== 0) {
-                            const stderrText = await new Response(child.stderr).text();
-                            const msg = `cursor-agent failed: ${(stderrText || "").trim()}`;
-                            const errChunk = createChatCompletionChunk(id, created, selectedModel, msg, true);
-                            controller.enqueue(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
-                            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                            return;
-                        }
-                        const doneChunk = createChatCompletionChunk(id, created, selectedModel, "", true);
-                        controller.enqueue(encoder.encode(`data: ${JSON.stringify(doneChunk)}\n\n`));
-                        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-                    }
-                    finally {
-                        closed = true;
-                        controller.close();
-                    }
-                },
-            });
-            return new Response(sse, {
-                status: 200,
-                headers: {
-                    "Content-Type": "text/event-stream",
-                    "Cache-Control": "no-cache",
-                    Connection: "keep-alive",
-                },
-            });
-        }
-        catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            return openAIError(500, "Proxy error", message);
-        }
+    let source = resolvedSource.source;
+    let selectedModel = normalizeCursorAgentModel(model, config.modelAliases);
+    if (tools.length > 0 && selectedModel === "auto") {
+        selectedModel = config.toolAutoModel;
+    }
+    const effectivePrompt = tools.length > 0 ? buildToolCallingPrompt(prompt, tools, workspaceDirectory) : prompt;
+    const launchBody = {
+        prompt: { text: effectivePrompt },
+        source,
+        target: { autoCreatePr: false },
     };
-    const bunAny = globalThis;
-    if (typeof bunAny.Bun !== "undefined" && typeof bunAny.Bun.serve === "function") {
-        // If another process already started a proxy on the default port, reuse it.
-        try {
-            const res = await fetch(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/health`).catch(() => null);
-            if (res && res.ok) {
-                g[key].baseURL = CURSOR_PROXY_DEFAULT_BASE_URL;
-                return CURSOR_PROXY_DEFAULT_BASE_URL;
+    if (selectedModel !== "auto") {
+        launchBody.model = selectedModel;
+    }
+    let launch = await cursorApiRequest(apiBaseUrl, apiKey, "/v0/agents", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(launchBody),
+    });
+    if (!launch.response.ok &&
+        source.ref &&
+        !resolvedSource.refIsExplicit &&
+        isBranchVerificationError(launch.text)) {
+        source = { repository: source.repository };
+        const retryLaunchBody = {
+            ...launchBody,
+            source,
+        };
+        launch = await cursorApiRequest(apiBaseUrl, apiKey, "/v0/agents", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(retryLaunchBody),
+        });
+    }
+    if (!launch.response.ok || !launch.data?.id) {
+        const details = launch.text || `HTTP ${launch.response.status}`;
+        throw new Error(`Failed to launch Cursor agent: ${details}`);
+    }
+    const agentId = launch.data.id;
+    const startedAt = Date.now();
+    while (true) {
+        if (Date.now() - startedAt > config.agentTimeoutMs) {
+            throw new Error(`Timed out waiting for Cursor agent ${agentId}`);
+        }
+        const statusResult = await cursorApiRequest(apiBaseUrl, apiKey, `/v0/agents/${agentId}`, {
+            method: "GET",
+        });
+        if (!statusResult.response.ok || !statusResult.data?.status) {
+            const details = statusResult.text || `HTTP ${statusResult.response.status}`;
+            throw new Error(`Failed to read Cursor agent status: ${details}`);
+        }
+        const status = statusResult.data.status;
+        if (!TERMINAL_AGENT_STATUSES.has(status)) {
+            await sleep(config.agentPollIntervalMs);
+            continue;
+        }
+        if (status !== "FINISHED") {
+            throw new Error(`Cursor agent ended with status ${status}`);
+        }
+        const conversation = await cursorApiRequest(apiBaseUrl, apiKey, `/v0/agents/${agentId}/conversation`, { method: "GET" });
+        return {
+            model: selectedModel === "auto" ? model || "auto" : selectedModel,
+            output: extractAssistantMessage(conversation.data) || statusResult.data.summary || "",
+        };
+    }
+}
+function createStreamingResponse(model, output, tools) {
+    const id = `cursor-api-${Date.now()}`;
+    const created = Math.floor(Date.now() / 1000);
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+        start(controller) {
+            const plan = tools.length > 0 ? parseToolCallPlan(output) : null;
+            if (plan?.action === "tool_call") {
+                const chunk = buildToolCallsChunk(id, created, model, plan.tool_calls);
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                controller.close();
+                return;
             }
+            const finalContent = plan?.action === "final" ? plan.content : output;
+            const chunk = createChatCompletionChunk(id, created, model, finalContent, true);
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+        },
+    });
+    return new Response(stream, {
+        status: 200,
+        headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+        },
+    });
+}
+function createNonStreamingResponse(model, output, tools) {
+    const plan = tools.length > 0 ? parseToolCallPlan(output) : null;
+    if (plan?.action === "tool_call") {
+        return new Response(JSON.stringify(createToolCallsCompletionResponse(model, plan.tool_calls)), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+    if (plan?.action === "final") {
+        return new Response(JSON.stringify(createChatCompletionResponse(model, plan.content)), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+    return new Response(JSON.stringify(createChatCompletionResponse(model, output)), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+    });
+}
+async function parseRequestBody(input, init) {
+    if (typeof init?.body === "string") {
+        try {
+            return JSON.parse(init.body);
         }
         catch {
-            // ignore
-        }
-        const startServer = (port) => {
-            return bunAny.Bun.serve({
-                hostname: CURSOR_PROXY_HOST,
-                port,
-                fetch: handler,
-            });
-        };
-        try {
-            const server = startServer(CURSOR_PROXY_DEFAULT_PORT);
-            const baseURL = `http://${CURSOR_PROXY_HOST}:${server.port}/v1`;
-            g[key].baseURL = baseURL;
-            return baseURL;
-        }
-        catch (error) {
-            const code = error?.code;
-            if (code !== "EADDRINUSE") {
-                throw error;
-            }
-            // Something is already bound to the default port. Only reuse it if it looks like our proxy.
-            try {
-                const res = await fetch(`http://${CURSOR_PROXY_HOST}:${CURSOR_PROXY_DEFAULT_PORT}/health`).catch(() => null);
-                if (res && res.ok) {
-                    g[key].baseURL = CURSOR_PROXY_DEFAULT_BASE_URL;
-                    return CURSOR_PROXY_DEFAULT_BASE_URL;
-                }
-            }
-            catch {
-                // ignore
-            }
-            // Fallback: start on a random free port.
-            const server = startServer(0);
-            const baseURL = `http://${CURSOR_PROXY_HOST}:${server.port}/v1`;
-            g[key].baseURL = baseURL;
-            return baseURL;
+            return {};
         }
     }
-    throw new Error("Cursor proxy server requires Bun runtime");
+    if (input instanceof Request) {
+        try {
+            return await input.clone().json();
+        }
+        catch {
+            return {};
+        }
+    }
+    return {};
 }
-export const CursorAuthPlugin = async ({ $, directory }) => {
-    const proxyBaseURL = await ensureCursorProxyServer(directory);
+export { parseCursorStreamLine, ensureCursorProxyServer };
+export const CursorAuthPlugin = async ({ directory }) => {
+    const config = getCursorPluginConfig();
+    const baseURL = `${trimTrailingSlash(config.apiBaseUrl)}/v1`;
     return {
         auth: {
             provider: CURSOR_PROVIDER_ID,
-            async loader(_getAuth) {
-                return {};
+            async loader(getAuth) {
+                return {
+                    apiKey: "",
+                    fetch: async (input, init) => {
+                        if (!isChatCompletionsRequest(input)) {
+                            return fetch(input, init);
+                        }
+                        const auth = await getAuth();
+                        const apiKey = resolveApiKey(auth) ?? extractApiKeyFromRequestInit(init);
+                        if (!apiKey) {
+                            return openAIError(401, "Cursor API key missing. Use `opencode auth login` for provider `cursor`.");
+                        }
+                        const requestBody = await parseRequestBody(input, init);
+                        const extracted = extractPromptFromChatCompletions(requestBody);
+                        if (!extracted.prompt.trim()) {
+                            return openAIError(400, "No prompt content found in chat request.");
+                        }
+                        try {
+                            const completion = await runCloudAgent(directory, config.apiBaseUrl, apiKey, extracted.model, extracted.prompt, extracted.tools);
+                            if (extracted.stream) {
+                                return createStreamingResponse(completion.model, completion.output, extracted.tools);
+                            }
+                            return createNonStreamingResponse(completion.model, completion.output, extracted.tools);
+                        }
+                        catch (error) {
+                            const message = error instanceof Error ? error.message : String(error);
+                            log.error("Cursor Cloud API request failed", { message });
+                            return openAIError(502, "Cursor Cloud API request failed", message);
+                        }
+                    },
+                };
             },
             methods: [
                 {
-                    label: "Login via cursor-agent (opens browser)",
+                    label: "Manually enter Cursor API key",
                     type: "api",
-                    authorize: async () => {
-                        const check = await $ `cursor-agent --version`.quiet().nothrow();
-                        if (check.exitCode !== 0) {
-                            return { type: "failed" };
-                        }
-                        const whoami = await $ `cursor-agent whoami`.quiet().nothrow();
-                        const whoamiText = whoami.text();
-                        if (whoamiText.includes("Not logged in")) {
-                            const login = await $ `cursor-agent login`.nothrow();
-                            if (login.exitCode !== 0) {
-                                return { type: "failed" };
-                            }
-                        }
-                        return {
-                            type: "success",
-                            key: "cursor-agent",
-                        };
-                    },
                 },
             ],
         },
@@ -577,9 +376,8 @@ export const CursorAuthPlugin = async ({ $, directory }) => {
             if (input.model.providerID !== CURSOR_PROVIDER_ID) {
                 return;
             }
-            // Always point to the actual proxy base URL (may be dynamically allocated).
-            output.options.baseURL = proxyBaseURL;
-            output.options.apiKey = output.options.apiKey || "cursor-agent";
+            output.options.baseURL = baseURL;
+            output.options.apiKey = output.options.apiKey || "cursor-api";
         },
     };
 };

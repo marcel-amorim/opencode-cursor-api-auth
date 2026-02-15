@@ -1,15 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin";
-export type CursorStreamEvent = {
-    type: "thinking";
-    text: string;
-} | {
-    type: "content";
-    text: string;
-} | {
-    type: "result";
-    text: string;
-};
-export declare function parseCursorStreamLine(line: string): CursorStreamEvent | null;
-export declare function ensureCursorProxyServer(workspaceDirectory: string): Promise<string>;
+import { ensureCursorProxyServer } from "./plugin/proxy.js";
+import { parseCursorStreamLine } from "./plugin/stream.js";
+export { parseCursorStreamLine, ensureCursorProxyServer };
 export declare const CursorAuthPlugin: Plugin;
 //# sourceMappingURL=plugin.d.ts.map

@@ -1,26 +1,16 @@
 #!/bin/bash
 set -e
 
-echo "=== opencode-cursor-auth Setup ==="
+echo "=== opencode-cursor-api-auth Setup ==="
 
-# 1. Check for cursor-agent
-if ! command -v cursor-agent &> /dev/null; then
-  echo "Installing Cursor CLI/Agent..."
-  # Official install command
-  curl https://cursor.com/install -fsS | bash
-  
-  # Ensure it's in PATH (installer usually adds it to ~/.local/bin)
-  export PATH="$HOME/.local/bin:$PATH"
-else
-  echo "Cursor Agent already installed."
-fi
-
-echo "Please authenticate with Cursor (this will open your browser)..."
-cursor-agent login
-
-echo " Authentication successful!"
-
-echo "Verifying token extraction..."
 npm install
 npm run build
-node dist/cli.js
+
+if [ -n "$CURSOR_API_KEY" ]; then
+  echo "Validating CURSOR_API_KEY against Cursor API..."
+  curl --silent --show-error -u "$CURSOR_API_KEY:" https://api.cursor.com/v0/me >/dev/null
+  echo "Cursor API key is valid."
+else
+  echo "CURSOR_API_KEY is not set."
+  echo "Set it and rerun if you want automatic validation."
+fi
