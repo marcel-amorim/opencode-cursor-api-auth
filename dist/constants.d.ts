@@ -1,5 +1,4 @@
 export declare const CURSOR_PROVIDER_ID: string;
-export declare const CURSOR_API_BASE_URL: string;
 export declare const CURSOR_PROXY_HOST: string;
 export declare const CURSOR_PROXY_DEFAULT_PORT: number;
 export declare const CURSOR_PROXY_DEFAULT_BASE_URL: string;

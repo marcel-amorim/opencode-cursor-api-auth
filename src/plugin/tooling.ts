@@ -4,6 +4,19 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function isSerializableRecord(value: unknown): value is Record<string, unknown> {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  try {
+    JSON.stringify(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function summarizeTool(tool: ToolDef): string {
   const name = tool.function?.name ?? "unknown";
   const description = tool.function?.description ?? "";
@@ -95,11 +108,21 @@ export function parseToolCallPlan(output: string): ToolCallPlan | null {
       }
       if (isRecord(parsed) && parsed.action === "tool_call" && Array.isArray(parsed.tool_calls)) {
         const toolCalls = parsed.tool_calls
-          .filter((item): item is Record<string, unknown> => isRecord(item) && typeof item.name === "string")
+          .filter(
+            (item): item is Record<string, unknown> =>
+              isRecord(item) &&
+              typeof item.name === "string" &&
+              item.name.trim().length > 0 &&
+              isSerializableRecord(item.arguments),
+          )
           .map((item) => ({
-            name: item.name as string,
-            arguments: isRecord(item.arguments) ? item.arguments : {},
+            name: (item.name as string).trim(),
+            arguments: item.arguments as Record<string, unknown>,
           }));
+
+        if (toolCalls.length === 0) {
+          return null;
+        }
 
         return { action: "tool_call", tool_calls: toolCalls };
       }

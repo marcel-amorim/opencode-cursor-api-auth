@@ -1,10 +1,17 @@
-export function openAIError(status: number, message: string, details?: string): Response {
+export function openAIError(
+  status: number,
+  message: string,
+  details?: string,
+  type = "cursor_agent_error",
+  code: string | null = null,
+  param: string | null = null,
+): Response {
   const body = {
     error: {
       message: details ? `${message}\n${details}` : message,
-      type: "cursor_agent_error",
-      param: null,
-      code: null,
+      type,
+      param,
+      code,
     },
   };
 

@@ -40,6 +40,17 @@ function isAddressInUseError(error) {
     }
     return error.code === "EADDRINUSE";
 }
+function terminateProcess(process) {
+    if (typeof process.kill !== "function") {
+        return;
+    }
+    try {
+        process.kill();
+    }
+    catch (error) {
+        log.debug("Failed to terminate process", { message: toErrorMessage(error) });
+    }
+}
 function createCursorAgentCommand(stream, workspaceDirectory, selectedModel, prompt) {
     return [
         "cursor-agent",
@@ -83,35 +94,43 @@ function buildToolCallsChunk(id, created, model, toolCalls) {
         ],
     };
 }
-async function handleNonStreamingRequest(process, selectedModel, tools) {
-    const [stdoutText, stderrText] = await Promise.all([
-        new Response(process.stdout).text(),
-        new Response(process.stderr ?? "").text(),
-    ]);
-    const stdout = (stdoutText || "").trim();
-    const stderr = (stderrText || "").trim();
-    const plan = tools.length > 0 ? parseToolCallPlan(stdout) : null;
-    if (plan?.action === "tool_call") {
-        return new Response(JSON.stringify(createToolCallsCompletionResponse(selectedModel, plan.tool_calls)), {
+async function handleNonStreamingRequest(process, selectedModel, tools, hasTimedOut, cleanupProcess) {
+    try {
+        const [stdoutText, stderrText] = await Promise.all([
+            new Response(process.stdout).text(),
+            new Response(process.stderr ?? "").text(),
+        ]);
+        if (hasTimedOut()) {
+            return openAIError(504, "cursor-agent timed out.", undefined, "timeout_error", "agent_timeout");
+        }
+        const stdout = (stdoutText || "").trim();
+        const stderr = (stderrText || "").trim();
+        const plan = tools.length > 0 ? parseToolCallPlan(stdout) : null;
+        if (plan?.action === "tool_call") {
+            return new Response(JSON.stringify(createToolCallsCompletionResponse(selectedModel, plan.tool_calls)), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+        if (plan?.action === "final") {
+            return new Response(JSON.stringify(createChatCompletionResponse(selectedModel, plan.content)), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+        if (process.exitCode !== 0 && stderr.length > 0) {
+            return openAIError(401, "cursor-agent failed.", stderr, "invalid_api_key_error", "cursor_agent_failed");
+        }
+        return new Response(JSON.stringify(createChatCompletionResponse(selectedModel, stdout || stderr)), {
             status: 200,
             headers: { "Content-Type": "application/json" },
         });
     }
-    if (plan?.action === "final") {
-        return new Response(JSON.stringify(createChatCompletionResponse(selectedModel, plan.content)), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-        });
+    finally {
+        cleanupProcess();
     }
-    if (process.exitCode !== 0 && stderr.length > 0) {
-        return openAIError(401, "cursor-agent failed.", stderr);
-    }
-    return new Response(JSON.stringify(createChatCompletionResponse(selectedModel, stdout || stderr)), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-    });
 }
-async function streamWithTools(process, selectedModel, id, created, encoder, controller, heartbeatIntervalMs) {
+async function streamWithTools(process, selectedModel, id, created, encoder, controller, heartbeatIntervalMs, hasTimedOut) {
     const heartbeat = () => {
         const pingChunk = createChatCompletionChunk(id, created, selectedModel, "", false);
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(pingChunk)}\n\n`));
@@ -168,6 +187,9 @@ async function streamWithTools(process, selectedModel, id, created, encoder, con
         while (true) {
             const { value, done } = await reader.read();
             if (done) {
+                break;
+            }
+            if (hasTimedOut()) {
                 break;
             }
             const chunk = decoder.decode(value, { stream: true });
@@ -240,6 +262,12 @@ async function streamWithTools(process, selectedModel, id, created, encoder, con
     finally {
         clearInterval(interval);
     }
+    if (hasTimedOut()) {
+        const timeoutChunk = createChatCompletionChunk(id, created, selectedModel, "cursor-agent timed out.", true);
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(timeoutChunk)}\n\n`));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        return;
+    }
     if (!fullOutput && accumulatedAssistant) {
         fullOutput = accumulatedAssistant;
     }
@@ -272,12 +300,15 @@ async function streamWithTools(process, selectedModel, id, created, encoder, con
     }
     controller.enqueue(encoder.encode("data: [DONE]\n\n"));
 }
-async function streamWithoutTools(process, selectedModel, id, created, encoder, controller) {
+async function streamWithoutTools(process, selectedModel, id, created, encoder, controller, hasTimedOut) {
     const decoder = new TextDecoder();
     const reader = process.stdout.getReader();
     while (true) {
         const { value, done } = await reader.read();
         if (done) {
+            break;
+        }
+        if (hasTimedOut()) {
             break;
         }
         if (!value || value.length === 0) {
@@ -289,6 +320,12 @@ async function streamWithoutTools(process, selectedModel, id, created, encoder, 
         }
         const chunk = createChatCompletionChunk(id, created, selectedModel, text, false);
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+    }
+    if (hasTimedOut()) {
+        const timeoutChunk = createChatCompletionChunk(id, created, selectedModel, "cursor-agent timed out.", true);
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(timeoutChunk)}\n\n`));
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        return;
     }
     if (process.exitCode !== 0) {
         const stderrText = await new Response(process.stderr ?? "").text();
@@ -302,22 +339,38 @@ async function streamWithoutTools(process, selectedModel, id, created, encoder, 
     controller.enqueue(encoder.encode(`data: ${JSON.stringify(doneChunk)}\n\n`));
     controller.enqueue(encoder.encode("data: [DONE]\n\n"));
 }
-function createStreamingResponse(process, selectedModel, tools, heartbeatIntervalMs) {
+function createStreamingResponse(process, selectedModel, tools, heartbeatIntervalMs, requestSignal, cleanupProcess, hasTimedOut) {
     const encoder = new TextEncoder();
     const id = `cursor-agent-${Date.now()}`;
     const created = Math.floor(Date.now() / 1000);
     const sse = new ReadableStream({
         async start(controller) {
+            const onAbort = () => {
+                cleanupProcess();
+            };
+            requestSignal.addEventListener("abort", onAbort, { once: true });
             try {
                 if (tools.length > 0) {
-                    await streamWithTools(process, selectedModel, id, created, encoder, controller, heartbeatIntervalMs);
+                    await streamWithTools(process, selectedModel, id, created, encoder, controller, heartbeatIntervalMs, hasTimedOut);
                     return;
                 }
-                await streamWithoutTools(process, selectedModel, id, created, encoder, controller);
+                await streamWithoutTools(process, selectedModel, id, created, encoder, controller, hasTimedOut);
             }
             finally {
-                controller.close();
+                requestSignal.removeEventListener("abort", onAbort);
+                cleanupProcess();
+                if (!requestSignal.aborted) {
+                    try {
+                        controller.close();
+                    }
+                    catch (error) {
+                        log.debug("Failed to close stream controller", { message: toErrorMessage(error) });
+                    }
+                }
             }
+        },
+        cancel() {
+            cleanupProcess();
         },
     });
     return new Response(sse, {
@@ -340,9 +393,15 @@ function createProxyHandler(workspaceDirectory, config) {
                 });
             }
             if (url.pathname !== "/v1/chat/completions" && url.pathname !== "/chat/completions") {
-                return openAIError(404, `Unsupported path: ${url.pathname}`);
+                return openAIError(404, `Unsupported path: ${url.pathname}`, undefined, "invalid_request_error", "unsupported_path");
             }
-            const body = await req.json().catch(() => ({}));
+            let body;
+            try {
+                body = await req.json();
+            }
+            catch (error) {
+                return openAIError(400, "Invalid JSON in request body.", toErrorMessage(error), "invalid_request_error", "invalid_json");
+            }
             const { prompt, model, stream, tools } = extractPromptFromChatCompletions(body);
             let selectedModel = normalizeCursorAgentModel(model, config.modelAliases);
             if (tools.length > 0 && selectedModel === "auto") {
@@ -351,7 +410,7 @@ function createProxyHandler(workspaceDirectory, config) {
             const effectivePrompt = tools.length > 0 ? buildToolCallingPrompt(prompt, tools, workspaceDirectory) : prompt;
             const bun = getBunRuntime();
             if (!bun) {
-                return openAIError(500, "This provider requires Bun runtime.");
+                return openAIError(500, "This provider requires Bun runtime.", undefined, "server_error", "bun_runtime_required");
             }
             const command = createCursorAgentCommand(stream, workspaceDirectory, selectedModel, effectivePrompt);
             const process = bun.spawn({
@@ -360,15 +419,30 @@ function createProxyHandler(workspaceDirectory, config) {
                 stderr: "pipe",
                 env: bun.env,
             });
+            let timedOut = false;
+            const timeout = setTimeout(() => {
+                timedOut = true;
+                terminateProcess(process);
+            }, config.agentTimeoutMs);
+            const hasTimedOut = () => timedOut;
+            let cleanedUp = false;
+            const cleanupProcess = () => {
+                if (cleanedUp) {
+                    return;
+                }
+                cleanedUp = true;
+                clearTimeout(timeout);
+                terminateProcess(process);
+            };
             if (!stream) {
-                return handleNonStreamingRequest(process, selectedModel, tools);
+                return handleNonStreamingRequest(process, selectedModel, tools, hasTimedOut, cleanupProcess);
             }
-            return createStreamingResponse(process, selectedModel, tools, config.heartbeatIntervalMs);
+            return createStreamingResponse(process, selectedModel, tools, config.heartbeatIntervalMs, req.signal, cleanupProcess, hasTimedOut);
         }
         catch (error) {
             const message = toErrorMessage(error);
             log.error("Proxy request failed", { message });
-            return openAIError(500, "Proxy error", message);
+            return openAIError(500, "Proxy error", message, "server_error", "proxy_error");
         }
     };
 }

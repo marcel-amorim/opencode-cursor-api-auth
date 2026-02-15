@@ -1,4 +1,4 @@
-export declare function openAIError(status: number, message: string, details?: string): Response;
+export declare function openAIError(status: number, message: string, details?: string, type?: string, code?: string | null, param?: string | null): Response;
 export declare function createChatCompletionResponse(model: string, content: string): {
     id: string;
     object: string;

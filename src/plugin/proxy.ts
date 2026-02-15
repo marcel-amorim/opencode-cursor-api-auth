@@ -18,6 +18,7 @@ interface BunSpawnProcess {
   stdout: ReadableStream<Uint8Array>;
   stderr: ReadableStream<Uint8Array> | null;
   exitCode: number | null;
+  kill?: (signal?: string | number) => void;
 }
 
 interface BunServer {
@@ -80,6 +81,18 @@ function isAddressInUseError(error: unknown): boolean {
   return (error as { code?: string }).code === "EADDRINUSE";
 }
 
+function terminateProcess(process: BunSpawnProcess): void {
+  if (typeof process.kill !== "function") {
+    return;
+  }
+
+  try {
+    process.kill();
+  } catch (error) {
+    log.debug("Failed to terminate process", { message: toErrorMessage(error) });
+  }
+}
+
 function createCursorAgentCommand(
   stream: boolean,
   workspaceDirectory: string,
@@ -139,38 +152,48 @@ async function handleNonStreamingRequest(
   process: BunSpawnProcess,
   selectedModel: string,
   tools: ToolDef[],
+  hasTimedOut: () => boolean,
+  cleanupProcess: () => void,
 ): Promise<Response> {
-  const [stdoutText, stderrText] = await Promise.all([
-    new Response(process.stdout).text(),
-    new Response(process.stderr ?? "").text(),
-  ]);
+  try {
+    const [stdoutText, stderrText] = await Promise.all([
+      new Response(process.stdout).text(),
+      new Response(process.stderr ?? "").text(),
+    ]);
 
-  const stdout = (stdoutText || "").trim();
-  const stderr = (stderrText || "").trim();
-  const plan = tools.length > 0 ? parseToolCallPlan(stdout) : null;
+    if (hasTimedOut()) {
+      return openAIError(504, "cursor-agent timed out.", undefined, "timeout_error", "agent_timeout");
+    }
 
-  if (plan?.action === "tool_call") {
-    return new Response(JSON.stringify(createToolCallsCompletionResponse(selectedModel, plan.tool_calls)), {
+    const stdout = (stdoutText || "").trim();
+    const stderr = (stderrText || "").trim();
+    const plan = tools.length > 0 ? parseToolCallPlan(stdout) : null;
+
+    if (plan?.action === "tool_call") {
+      return new Response(JSON.stringify(createToolCallsCompletionResponse(selectedModel, plan.tool_calls)), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (plan?.action === "final") {
+      return new Response(JSON.stringify(createChatCompletionResponse(selectedModel, plan.content)), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    if (process.exitCode !== 0 && stderr.length > 0) {
+      return openAIError(401, "cursor-agent failed.", stderr, "invalid_api_key_error", "cursor_agent_failed");
+    }
+
+    return new Response(JSON.stringify(createChatCompletionResponse(selectedModel, stdout || stderr)), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
+  } finally {
+    cleanupProcess();
   }
-
-  if (plan?.action === "final") {
-    return new Response(JSON.stringify(createChatCompletionResponse(selectedModel, plan.content)), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  }
-
-  if (process.exitCode !== 0 && stderr.length > 0) {
-    return openAIError(401, "cursor-agent failed.", stderr);
-  }
-
-  return new Response(JSON.stringify(createChatCompletionResponse(selectedModel, stdout || stderr)), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
 }
 
 async function streamWithTools(
@@ -181,6 +204,7 @@ async function streamWithTools(
   encoder: TextEncoder,
   controller: ReadableStreamDefaultController<Uint8Array>,
   heartbeatIntervalMs: number,
+  hasTimedOut: () => boolean,
 ): Promise<void> {
   const heartbeat = () => {
     const pingChunk = createChatCompletionChunk(id, created, selectedModel, "", false);
@@ -250,6 +274,9 @@ async function streamWithTools(
     while (true) {
       const { value, done } = await reader.read();
       if (done) {
+        break;
+      }
+      if (hasTimedOut()) {
         break;
       }
 
@@ -330,6 +357,13 @@ async function streamWithTools(
     clearInterval(interval);
   }
 
+  if (hasTimedOut()) {
+    const timeoutChunk = createChatCompletionChunk(id, created, selectedModel, "cursor-agent timed out.", true);
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(timeoutChunk)}\n\n`));
+    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+    return;
+  }
+
   if (!fullOutput && accumulatedAssistant) {
     fullOutput = accumulatedAssistant;
   }
@@ -371,6 +405,7 @@ async function streamWithoutTools(
   created: number,
   encoder: TextEncoder,
   controller: ReadableStreamDefaultController<Uint8Array>,
+  hasTimedOut: () => boolean,
 ): Promise<void> {
   const decoder = new TextDecoder();
   const reader = process.stdout.getReader();
@@ -378,6 +413,9 @@ async function streamWithoutTools(
   while (true) {
     const { value, done } = await reader.read();
     if (done) {
+      break;
+    }
+    if (hasTimedOut()) {
       break;
     }
     if (!value || value.length === 0) {
@@ -391,6 +429,13 @@ async function streamWithoutTools(
 
     const chunk = createChatCompletionChunk(id, created, selectedModel, text, false);
     controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+  }
+
+  if (hasTimedOut()) {
+    const timeoutChunk = createChatCompletionChunk(id, created, selectedModel, "cursor-agent timed out.", true);
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(timeoutChunk)}\n\n`));
+    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+    return;
   }
 
   if (process.exitCode !== 0) {
@@ -412,6 +457,9 @@ function createStreamingResponse(
   selectedModel: string,
   tools: ToolDef[],
   heartbeatIntervalMs: number,
+  requestSignal: AbortSignal,
+  cleanupProcess: () => void,
+  hasTimedOut: () => boolean,
 ): Response {
   const encoder = new TextEncoder();
   const id = `cursor-agent-${Date.now()}`;
@@ -419,16 +467,33 @@ function createStreamingResponse(
 
   const sse = new ReadableStream({
     async start(controller) {
+      const onAbort = () => {
+        cleanupProcess();
+      };
+
+      requestSignal.addEventListener("abort", onAbort, { once: true });
+
       try {
         if (tools.length > 0) {
-          await streamWithTools(process, selectedModel, id, created, encoder, controller, heartbeatIntervalMs);
+          await streamWithTools(process, selectedModel, id, created, encoder, controller, heartbeatIntervalMs, hasTimedOut);
           return;
         }
 
-        await streamWithoutTools(process, selectedModel, id, created, encoder, controller);
+        await streamWithoutTools(process, selectedModel, id, created, encoder, controller, hasTimedOut);
       } finally {
-        controller.close();
+        requestSignal.removeEventListener("abort", onAbort);
+        cleanupProcess();
+        if (!requestSignal.aborted) {
+          try {
+            controller.close();
+          } catch (error) {
+            log.debug("Failed to close stream controller", { message: toErrorMessage(error) });
+          }
+        }
       }
+    },
+    cancel() {
+      cleanupProcess();
     },
   });
 
@@ -458,10 +523,16 @@ function createProxyHandler(
       }
 
       if (url.pathname !== "/v1/chat/completions" && url.pathname !== "/chat/completions") {
-        return openAIError(404, `Unsupported path: ${url.pathname}`);
+        return openAIError(404, `Unsupported path: ${url.pathname}`, undefined, "invalid_request_error", "unsupported_path");
       }
 
-      const body = await req.json().catch(() => ({}));
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch (error) {
+        return openAIError(400, "Invalid JSON in request body.", toErrorMessage(error), "invalid_request_error", "invalid_json");
+      }
+
       const { prompt, model, stream, tools } = extractPromptFromChatCompletions(body);
       let selectedModel = normalizeCursorAgentModel(model, config.modelAliases);
       if (tools.length > 0 && selectedModel === "auto") {
@@ -471,7 +542,7 @@ function createProxyHandler(
       const effectivePrompt = tools.length > 0 ? buildToolCallingPrompt(prompt, tools, workspaceDirectory) : prompt;
       const bun = getBunRuntime();
       if (!bun) {
-        return openAIError(500, "This provider requires Bun runtime.");
+        return openAIError(500, "This provider requires Bun runtime.", undefined, "server_error", "bun_runtime_required");
       }
 
       const command = createCursorAgentCommand(stream, workspaceDirectory, selectedModel, effectivePrompt);
@@ -482,15 +553,40 @@ function createProxyHandler(
         env: bun.env,
       });
 
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        terminateProcess(process);
+      }, config.agentTimeoutMs);
+
+      const hasTimedOut = () => timedOut;
+      let cleanedUp = false;
+      const cleanupProcess = () => {
+        if (cleanedUp) {
+          return;
+        }
+        cleanedUp = true;
+        clearTimeout(timeout);
+        terminateProcess(process);
+      };
+
       if (!stream) {
-        return handleNonStreamingRequest(process, selectedModel, tools);
+        return handleNonStreamingRequest(process, selectedModel, tools, hasTimedOut, cleanupProcess);
       }
 
-      return createStreamingResponse(process, selectedModel, tools, config.heartbeatIntervalMs);
+      return createStreamingResponse(
+        process,
+        selectedModel,
+        tools,
+        config.heartbeatIntervalMs,
+        req.signal,
+        cleanupProcess,
+        hasTimedOut,
+      );
     } catch (error) {
       const message = toErrorMessage(error);
       log.error("Proxy request failed", { message });
-      return openAIError(500, "Proxy error", message);
+      return openAIError(500, "Proxy error", message, "server_error", "proxy_error");
     }
   };
 }

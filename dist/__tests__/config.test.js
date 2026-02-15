@@ -12,7 +12,6 @@ describe("createCursorPluginConfigFromEnv", () => {
     test("reads overrides from env", () => {
         const config = createCursorPluginConfigFromEnv({
             CURSOR_PROVIDER_ID: "cursor-custom",
-            CURSOR_API_BASE_URL: "https://api.example.com",
             CURSOR_PROXY_HOST: "0.0.0.0",
             CURSOR_PROXY_PORT: "4545",
             CURSOR_PROXY_HEARTBEAT_MS: "2500",
@@ -21,7 +20,6 @@ describe("createCursorPluginConfigFromEnv", () => {
             CURSOR_MODEL_ALIASES: JSON.stringify({ "my-model": "my-model-v2" }),
         });
         expect(config.providerId).toBe("cursor-custom");
-        expect(config.apiBaseUrl).toBe("https://api.example.com");
         expect(config.proxyHost).toBe("0.0.0.0");
         expect(config.proxyPort).toBe(4545);
         expect(config.heartbeatIntervalMs).toBe(2500);

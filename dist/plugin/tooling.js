@@ -1,6 +1,18 @@
 function isRecord(value) {
     return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
+function isSerializableRecord(value) {
+    if (!isRecord(value)) {
+        return false;
+    }
+    try {
+        JSON.stringify(value);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
 function summarizeTool(tool) {
     const name = tool.function?.name ?? "unknown";
     const description = tool.function?.description ?? "";
@@ -79,11 +91,17 @@ export function parseToolCallPlan(output) {
             }
             if (isRecord(parsed) && parsed.action === "tool_call" && Array.isArray(parsed.tool_calls)) {
                 const toolCalls = parsed.tool_calls
-                    .filter((item) => isRecord(item) && typeof item.name === "string")
+                    .filter((item) => isRecord(item) &&
+                    typeof item.name === "string" &&
+                    item.name.trim().length > 0 &&
+                    isSerializableRecord(item.arguments))
                     .map((item) => ({
-                    name: item.name,
-                    arguments: isRecord(item.arguments) ? item.arguments : {},
+                    name: item.name.trim(),
+                    arguments: item.arguments,
                 }));
+                if (toolCalls.length === 0) {
+                    return null;
+                }
                 return { action: "tool_call", tool_calls: toolCalls };
             }
         }

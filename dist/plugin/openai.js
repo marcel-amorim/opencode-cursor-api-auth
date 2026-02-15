@@ -1,10 +1,10 @@
-export function openAIError(status, message, details) {
+export function openAIError(status, message, details, type = "cursor_agent_error", code = null, param = null) {
     const body = {
         error: {
             message: details ? `${message}\n${details}` : message,
-            type: "cursor_agent_error",
-            param: null,
-            code: null,
+            type,
+            param,
+            code,
         },
     };
     return new Response(JSON.stringify(body), {
