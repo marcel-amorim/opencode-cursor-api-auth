@@ -1,7 +1,7 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin";
 import type { Auth } from "@opencode-ai/sdk";
-import { CURSOR_PROVIDER_ID } from "./constants.js";
 import { getCursorPluginConfig } from "./config/loader.js";
+import { buildRuntimeProviderModels, syncCursorModels } from "./cursor/model-sync.js";
 import { CursorCommandError } from "./plugin/errors.js";
 import { ensureCursorProxyServer } from "./plugin/proxy.js";
 import { parseCursorStreamLine } from "./plugin/stream.js";
@@ -21,6 +21,10 @@ interface ShellCommand {
 
 interface ShellRunner {
   (strings: TemplateStringsArray, ...values: unknown[]): ShellCommand;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 async function authorizeCursorAgent($: ShellRunner): Promise<{ type: "success"; key: string } | { type: "failed" }> {
@@ -64,10 +68,43 @@ export { parseCursorStreamLine, ensureCursorProxyServer };
 export const CursorAuthPlugin: Plugin = async ({ $, directory }: PluginInput) => {
   const config = getCursorPluginConfig();
   const proxyBaseURL = await ensureCursorProxyServer(directory, config);
+  const modelSync = await syncCursorModels(directory, config);
 
   return {
+    async config(opencodeConfig: any) {
+      if (!config.modelDiscoveryEnabled || !isRecord(opencodeConfig)) {
+        return;
+      }
+
+      let providers: Record<string, unknown>;
+      if (isRecord(opencodeConfig.provider)) {
+        providers = opencodeConfig.provider;
+      } else {
+        providers = {};
+        opencodeConfig.provider = providers;
+      }
+
+      let providerConfig: Record<string, unknown>;
+      if (isRecord(providers[config.providerId])) {
+        providerConfig = providers[config.providerId] as Record<string, unknown>;
+      } else {
+        providerConfig = {};
+        providers[config.providerId] = providerConfig;
+      }
+
+      const existingModels = isRecord(providerConfig.models) ? providerConfig.models : undefined;
+      providerConfig.models = buildRuntimeProviderModels(existingModels, modelSync.models, config.fallbackModels);
+
+      if (modelSync.warnings.length > 0) {
+        log.warn("Startup model sync completed with warnings", {
+          source: modelSync.source,
+          warnings: modelSync.warnings,
+        });
+      }
+    },
+
     auth: {
-      provider: CURSOR_PROVIDER_ID,
+      provider: config.providerId,
       async loader(_getAuth: () => Promise<Auth>) {
         return {};
       },
@@ -81,7 +118,7 @@ export const CursorAuthPlugin: Plugin = async ({ $, directory }: PluginInput) =>
     },
 
     async "chat.params"(input, output) {
-      if (input.model.providerID !== CURSOR_PROVIDER_ID) {
+      if (input.model.providerID !== config.providerId) {
         return;
       }
 

@@ -1,10 +1,13 @@
-import { CURSOR_PROVIDER_ID } from "./constants.js";
 import { getCursorPluginConfig } from "./config/loader.js";
+import { buildRuntimeProviderModels, syncCursorModels } from "./cursor/model-sync.js";
 import { CursorCommandError } from "./plugin/errors.js";
 import { ensureCursorProxyServer } from "./plugin/proxy.js";
 import { parseCursorStreamLine } from "./plugin/stream.js";
 import { createLogger } from "./utils/logger.js";
 const log = createLogger("plugin");
+function isRecord(value) {
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
 async function authorizeCursorAgent($) {
     const check = await $ `cursor-agent --version`.quiet().nothrow();
     if (check.exitCode !== 0) {
@@ -41,9 +44,39 @@ export { parseCursorStreamLine, ensureCursorProxyServer };
 export const CursorAuthPlugin = async ({ $, directory }) => {
     const config = getCursorPluginConfig();
     const proxyBaseURL = await ensureCursorProxyServer(directory, config);
+    const modelSync = await syncCursorModels(directory, config);
     return {
+        async config(opencodeConfig) {
+            if (!config.modelDiscoveryEnabled || !isRecord(opencodeConfig)) {
+                return;
+            }
+            let providers;
+            if (isRecord(opencodeConfig.provider)) {
+                providers = opencodeConfig.provider;
+            }
+            else {
+                providers = {};
+                opencodeConfig.provider = providers;
+            }
+            let providerConfig;
+            if (isRecord(providers[config.providerId])) {
+                providerConfig = providers[config.providerId];
+            }
+            else {
+                providerConfig = {};
+                providers[config.providerId] = providerConfig;
+            }
+            const existingModels = isRecord(providerConfig.models) ? providerConfig.models : undefined;
+            providerConfig.models = buildRuntimeProviderModels(existingModels, modelSync.models, config.fallbackModels);
+            if (modelSync.warnings.length > 0) {
+                log.warn("Startup model sync completed with warnings", {
+                    source: modelSync.source,
+                    warnings: modelSync.warnings,
+                });
+            }
+        },
         auth: {
-            provider: CURSOR_PROVIDER_ID,
+            provider: config.providerId,
             async loader(_getAuth) {
                 return {};
             },
@@ -56,7 +89,7 @@ export const CursorAuthPlugin = async ({ $, directory }) => {
             ],
         },
         async "chat.params"(input, output) {
-            if (input.model.providerID !== CURSOR_PROVIDER_ID) {
+            if (input.model.providerID !== config.providerId) {
                 return;
             }
             output.options.baseURL = proxyBaseURL;

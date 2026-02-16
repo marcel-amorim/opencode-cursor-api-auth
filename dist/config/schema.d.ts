@@ -8,6 +8,10 @@ export declare const cursorPluginConfigSchema: z.ZodObject<{
     toolAutoModel: z.ZodDefault<z.ZodString>;
     agentTimeoutMs: z.ZodDefault<z.ZodNumber>;
     modelAliases: z.ZodDefault<z.ZodRecord<z.ZodString, z.ZodString>>;
+    modelDiscoveryEnabled: z.ZodDefault<z.ZodBoolean>;
+    modelDiscoveryCachePath: z.ZodDefault<z.ZodString>;
+    modelDiscoveryCacheTtlMs: z.ZodDefault<z.ZodNumber>;
+    fallbackModels: z.ZodDefault<z.ZodArray<z.ZodString, "many">>;
 }, "strip", z.ZodTypeAny, {
     providerId: string;
     proxyHost: string;
@@ -17,6 +21,10 @@ export declare const cursorPluginConfigSchema: z.ZodObject<{
     toolAutoModel: string;
     agentTimeoutMs: number;
     modelAliases: Record<string, string>;
+    modelDiscoveryEnabled: boolean;
+    modelDiscoveryCachePath: string;
+    modelDiscoveryCacheTtlMs: number;
+    fallbackModels: string[];
 }, {
     providerId?: string | undefined;
     proxyHost?: string | undefined;
@@ -26,6 +34,10 @@ export declare const cursorPluginConfigSchema: z.ZodObject<{
     toolAutoModel?: string | undefined;
     agentTimeoutMs?: number | undefined;
     modelAliases?: Record<string, string> | undefined;
+    modelDiscoveryEnabled?: boolean | undefined;
+    modelDiscoveryCachePath?: string | undefined;
+    modelDiscoveryCacheTtlMs?: number | undefined;
+    fallbackModels?: string[] | undefined;
 }>;
 export type CursorPluginConfig = z.infer<typeof cursorPluginConfigSchema>;
 //# sourceMappingURL=schema.d.ts.map
