@@ -15,7 +15,7 @@ export type ModelCacheReadResult = {
     path: string;
     reason: "missing" | "invalid" | "expired";
 };
-export declare function resolveModelCachePath(workspaceDirectory: string, cachePath: string): string;
+export declare function resolveModelCachePath(_workspaceDirectory: string, cachePath: string): string;
 export declare function readModelCache(workspaceDirectory: string, config: CursorPluginConfig): Promise<ModelCacheReadResult>;
 export declare function writeModelCache(workspaceDirectory: string, config: CursorPluginConfig, models: string[], source: ModelCacheSource): Promise<void>;
 export {};

@@ -14,9 +14,19 @@ function createConfig(cachePath: string) {
 }
 
 describe("model cache", () => {
+  test("resolves relative cache path under global opencode directory", () => {
+    const resolved = resolveModelCachePath("/workspace/ignored", "models-cache.json");
+    const homeDirectory = os.homedir().trim();
+    const expectedBaseDirectory = homeDirectory.length > 0
+      ? path.join(homeDirectory, ".opencode")
+      : path.join(os.tmpdir(), "opencode");
+
+    expect(resolved).toBe(path.join(expectedBaseDirectory, "models-cache.json"));
+  });
+
   test("writes and reads cache entry", async () => {
     const tempDir = mkdtempSync(path.join(os.tmpdir(), "cursor-model-cache-"));
-    const config = createConfig("models-cache.json");
+    const config = createConfig(path.join(tempDir, "models-cache.json"));
 
     await writeModelCache(tempDir, config, ["gpt-5.2", "auto"], "discovered");
     const result = await readModelCache(tempDir, config);
@@ -32,7 +42,7 @@ describe("model cache", () => {
 
   test("returns expired for stale cache entries", async () => {
     const tempDir = mkdtempSync(path.join(os.tmpdir(), "cursor-model-cache-"));
-    const config = createConfig("models-cache.json");
+    const config = createConfig(path.join(tempDir, "models-cache.json"));
     const cachePath = resolveModelCachePath(tempDir, config.modelDiscoveryCachePath);
 
     writeFileSync(
@@ -57,7 +67,7 @@ describe("model cache", () => {
 
   test("returns invalid for corrupt cache payload", async () => {
     const tempDir = mkdtempSync(path.join(os.tmpdir(), "cursor-model-cache-"));
-    const config = createConfig("models-cache.json");
+    const config = createConfig(path.join(tempDir, "models-cache.json"));
     const cachePath = resolveModelCachePath(tempDir, config.modelDiscoveryCachePath);
 
     writeFileSync(cachePath, "{", "utf8");

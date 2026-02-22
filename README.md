@@ -96,7 +96,7 @@ All env vars are optional.
 | `CURSOR_AGENT_TIMEOUT_MS` | `600000` | cursor-agent timeout in ms |
 | `CURSOR_MODEL_ALIASES` | `{"gpt-5":"gpt-5.2","sonnet-4":"sonnet-4.5"}` | JSON object for alias mapping |
 | `CURSOR_MODEL_DISCOVERY_ENABLED` | `true` | Enables startup model discovery |
-| `CURSOR_MODEL_DISCOVERY_CACHE_PATH` | `.cursor-models-cache.json` | Cache file path (relative to workspace unless absolute) |
+| `CURSOR_MODEL_DISCOVERY_CACHE_PATH` | `.cursor-models-cache.json` | Cache file path (stored in `~/.opencode/` when relative, unless absolute) |
 | `CURSOR_MODEL_DISCOVERY_CACHE_TTL_MS` | `86400000` | Cache ttl in ms |
 | `CURSOR_FALLBACK_MODELS` | `auto,gpt-5.2,sonnet-4.5,sonnet-4.5-thinking` | JSON array or comma-separated fallback model ids |
 

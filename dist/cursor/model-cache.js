@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { createLogger } from "../utils/logger.js";
 const log = createLogger("model-cache");
@@ -15,11 +16,18 @@ function isModelCacheEntry(value) {
     }
     return record.models.every((item) => typeof item === "string");
 }
-export function resolveModelCachePath(workspaceDirectory, cachePath) {
+export function resolveModelCachePath(_workspaceDirectory, cachePath) {
     if (path.isAbsolute(cachePath)) {
         return cachePath;
     }
-    return path.join(workspaceDirectory, cachePath);
+    const homeDirectory = os.homedir().trim();
+    if (cachePath.startsWith("~/") && homeDirectory.length > 0) {
+        return path.join(homeDirectory, cachePath.slice(2));
+    }
+    const globalCacheDirectory = homeDirectory.length > 0
+        ? path.join(homeDirectory, ".opencode")
+        : path.join(os.tmpdir(), "opencode");
+    return path.join(globalCacheDirectory, cachePath);
 }
 export async function readModelCache(workspaceDirectory, config) {
     const cachePath = resolveModelCachePath(workspaceDirectory, config.modelDiscoveryCachePath);

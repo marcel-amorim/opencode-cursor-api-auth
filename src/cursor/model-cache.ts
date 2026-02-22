@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import type { CursorPluginConfig } from "../config/schema.js";
 import { createLogger } from "../utils/logger.js";
@@ -43,11 +44,20 @@ function isModelCacheEntry(value: unknown): value is ModelCacheEntry {
   return record.models.every((item) => typeof item === "string");
 }
 
-export function resolveModelCachePath(workspaceDirectory: string, cachePath: string): string {
+export function resolveModelCachePath(_workspaceDirectory: string, cachePath: string): string {
   if (path.isAbsolute(cachePath)) {
     return cachePath;
   }
-  return path.join(workspaceDirectory, cachePath);
+
+  const homeDirectory = os.homedir().trim();
+  if (cachePath.startsWith("~/") && homeDirectory.length > 0) {
+    return path.join(homeDirectory, cachePath.slice(2));
+  }
+
+  const globalCacheDirectory = homeDirectory.length > 0
+    ? path.join(homeDirectory, ".opencode")
+    : path.join(os.tmpdir(), "opencode");
+  return path.join(globalCacheDirectory, cachePath);
 }
 
 export async function readModelCache(workspaceDirectory: string, config: CursorPluginConfig): Promise<ModelCacheReadResult> {
